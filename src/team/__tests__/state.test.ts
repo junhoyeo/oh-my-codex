@@ -1,4 +1,4 @@
-import { describe, it } from 'node:test';
+import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm, writeFile, readFile, mkdir, utimes } from 'fs/promises';
 import { join } from 'path';
@@ -32,6 +32,8 @@ import {
   updateTask,
   updateWorkerHeartbeat,
   writeAtomic,
+  setWriteAtomicRenameForTests,
+  resetWriteAtomicRenameForTests,
   writeWorkerInbox,
   enqueueDispatchRequest,
   listDispatchRequests,
@@ -41,6 +43,10 @@ import {
   readDispatchRequest,
   resolveDispatchLockTimeoutMs,
 } from '../state.js';
+
+afterEach(() => {
+  resetWriteAtomicRenameForTests();
+});
 
 describe('team state', () => {
   it('initTeamState creates correct directory structure and config.json', async () => {
@@ -1185,6 +1191,47 @@ describe('team state', () => {
       assert.equal(existsSync(p), true);
       const content = readFileSync(p, 'utf8');
       assert.ok(content === 'a' || content === 'b');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('writeAtomic does not swallow ENOENT when destination content differs', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-state-'));
+    try {
+      const p = join(cwd, 'atomic-fallback.txt');
+      await writeFile(p, 'old', 'utf8');
+
+      setWriteAtomicRenameForTests(async () => {
+        const err = new Error('missing temp') as NodeJS.ErrnoException;
+        err.code = 'ENOENT';
+        throw err;
+      });
+
+      await assert.rejects(() => writeAtomic(p, 'new'), (error: unknown) => {
+        const err = error as NodeJS.ErrnoException;
+        return err.code === 'ENOENT';
+      });
+      assert.equal(readFileSync(p, 'utf8'), 'old');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('writeAtomic keeps ENOENT fallback when destination already has expected content', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-state-'));
+    try {
+      const p = join(cwd, 'atomic-fallback-safe.txt');
+      await writeFile(p, 'same-content', 'utf8');
+
+      setWriteAtomicRenameForTests(async () => {
+        const err = new Error('missing temp') as NodeJS.ErrnoException;
+        err.code = 'ENOENT';
+        throw err;
+      });
+
+      await writeAtomic(p, 'same-content');
+      assert.equal(readFileSync(p, 'utf8'), 'same-content');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

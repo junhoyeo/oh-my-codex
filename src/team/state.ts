@@ -242,6 +242,16 @@ interface TeamSummarySnapshot {
   workerTaskByName: Record<string, string>;
 }
 
+let renameForAtomicWrite: typeof rename = rename;
+
+export function setWriteAtomicRenameForTests(fn: typeof rename): void {
+  renameForAtomicWrite = fn;
+}
+
+export function resetWriteAtomicRenameForTests(): void {
+  renameForAtomicWrite = rename;
+}
+
 export type TaskReadiness =
   | { ready: true }
   | { ready: false; reason: 'blocked_dependency'; dependencies: string[] };
@@ -615,11 +625,16 @@ export async function writeAtomic(filePath: string, data: string): Promise<void>
   await writeFile(tmpPath, data, 'utf8');
 
   try {
-    await rename(tmpPath, filePath);
+    await renameForAtomicWrite(tmpPath, filePath);
   } catch (error) {
     const err = error as NodeJS.ErrnoException;
     if (err.code === 'ENOENT' && existsSync(filePath)) {
-      return;
+      try {
+        const existing = await readFile(filePath, 'utf8');
+        if (existing === data) return;
+      } catch {
+        // Preserve original ENOENT below if destination cannot be read.
+      }
     }
     throw error;
   }
