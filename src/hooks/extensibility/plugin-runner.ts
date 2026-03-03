@@ -1,4 +1,5 @@
-import { basename } from 'path';
+import { realpathSync } from 'fs';
+import { basename, join } from 'path';
 import { pathToFileURL } from 'url';
 import { createHookPluginSdk } from './sdk.js';
 import type { HookEventEnvelope, HookPluginModule } from './types.js';
@@ -52,6 +53,12 @@ async function main(): Promise<void> {
   const pluginId = (request.pluginId || basename(request.pluginPath || 'unknown')).trim() || 'unknown';
 
   try {
+    const pluginDir = join(process.cwd(), '.omx', 'hooks');
+    const realPluginPath = realpathSync(request.pluginPath);
+    if (!realPluginPath.startsWith(`${pluginDir}/`) && realPluginPath !== pluginDir) {
+      throw new Error(`Plugin path outside allowed directory: ${request.pluginPath}`);
+    }
+    process.stderr.write('[plugin-runner] Loading plugin modules can execute arbitrary code; ensure plugins are trusted.\n');
     const moduleUrl = `${pathToFileURL(request.pluginPath).href}?t=${Date.now()}`;
     const loaded = await import(moduleUrl) as HookPluginModule;
     if (typeof loaded.onHookEvent !== 'function') {

@@ -6,8 +6,8 @@
  * to avoid blocking hooks.
  *
  * SECURITY: Command gateway requires OMX_OPENCLAW_COMMAND=1 opt-in.
- * Hard 5-second timeout (non-configurable). Prefers execFile for
- * simple commands; falls back to sh -c only for shell metacharacters.
+ * Hard 5-second timeout (non-configurable). Uses execFile for
+ * clean commands and rejects shell metacharacters.
  */
 
 import type {
@@ -24,7 +24,7 @@ const DEFAULT_HTTP_TIMEOUT_MS = 10_000;
 /** Hard non-configurable timeout for command gateways */
 const COMMAND_TIMEOUT_MS = 5_000;
 
-/** Shell metacharacters that require sh -c instead of execFile */
+/** Shell metacharacters rejected by command gateway */
 const SHELL_METACHAR_RE = /[|&;><`$()]/;
 
 /**
@@ -151,8 +151,8 @@ export async function wakeGateway(
  * SECURITY REQUIREMENTS:
  * - Requires OMX_OPENCLAW_COMMAND=1 opt-in (separate gate from OMX_OPENCLAW)
  * - Hard 5-second timeout (non-configurable)
- * - Prefers execFile for simple commands (no metacharacters)
- * - Falls back to sh -c only when metacharacters detected
+ * - Uses execFile for simple commands (no metacharacters)
+ * - Rejects commands containing shell metacharacters
  * - detached: false to prevent orphan processes
  * - SIGTERM cleanup handler kills child on parent SIGTERM, 1s grace then SIGKILL
  *
@@ -177,7 +177,7 @@ export async function wakeCommandGateway(
   let sigtermHandler: (() => void) | null = null;
 
   try {
-    const { execFile, exec } = await import("child_process");
+    const { execFile } = await import("child_process");
 
     // Interpolate variables with shell escaping
     const interpolated = gatewayConfig.command.replace(
@@ -189,8 +189,15 @@ export async function wakeCommandGateway(
       },
     );
 
-    // Detect whether the interpolated command contains shell metacharacters
-    const hasMetachars = SHELL_METACHAR_RE.test(interpolated);
+    process.stderr.write(`[openclaw] Executing gateway command: ${interpolated.slice(0, 200)}\n`);
+    if (SHELL_METACHAR_RE.test(interpolated)) {
+      process.stderr.write(`[openclaw] Rejected command with shell metacharacters\n`);
+      return {
+        gateway: gatewayName,
+        success: false,
+        error: "Rejected command with shell metacharacters",
+      };
+    }
 
     await new Promise<void>((resolve, reject) => {
       const cleanup = (signal: NodeJS.Signals) => {
@@ -228,22 +235,14 @@ export async function wakeCommandGateway(
         reject(err);
       };
 
-      if (hasMetachars) {
-        // Fall back to sh -c for complex commands with metacharacters
-        child = exec(interpolated, {
-          timeout: COMMAND_TIMEOUT_MS,
-          env: { ...process.env },
-        });
-      } else {
-        // Parse simple command: split on whitespace, use execFile
-        const parts = interpolated.split(/\s+/).filter(Boolean);
-        const cmd = parts[0];
-        const args = parts.slice(1);
-        child = execFile(cmd, args, {
-          timeout: COMMAND_TIMEOUT_MS,
-          env: { ...process.env },
-        });
-      }
+      // Parse simple command: split on whitespace, use execFile
+      const parts = interpolated.split(/\s+/).filter(Boolean);
+      const cmd = parts[0];
+      const args = parts.slice(1);
+      child = execFile(cmd, args, {
+        timeout: COMMAND_TIMEOUT_MS,
+        env: { ...process.env },
+      });
 
       // Ensure detached is false (default, but explicit via options above)
       child.on("exit", onExit);

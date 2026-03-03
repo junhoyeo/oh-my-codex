@@ -29,6 +29,19 @@ function errorResult(msg: string) {
   return { content: [{ type: 'text' as const, text: JSON.stringify({ error: msg }) }], isError: true };
 }
 
+function validateFilePath(filePath: string, workingDir: string): string {
+  const normalizedWorkingDir = resolve(workingDir);
+  const resolved = resolve(normalizedWorkingDir, filePath);
+  if (!resolved.startsWith(normalizedWorkingDir + '/') && resolved !== normalizedWorkingDir) {
+    throw new Error(`Path traversal detected: ${filePath}`);
+  }
+  return resolved;
+}
+
+function sanitizeSymbolName(name: string): string {
+  return name.replace(/[^\w.-]/g, '');
+}
+
 async function exec(cmd: string, args: string[], options: { cwd?: string; timeout?: number } = {}): Promise<{ stdout: string; stderr: string }> {
   try {
     return await execFileAsync(cmd, args, {
@@ -267,6 +280,8 @@ async function searchWorkspaceSymbols(
   dir: string,
   maxResults: number = 50
 ): Promise<DocumentSymbol[]> {
+  const sanitizedQuery = sanitizeSymbolName(query);
+  if (!sanitizedQuery) return [];
   const results: (DocumentSymbol & { file: string })[] = [];
 
   async function walk(d: string, depth: number): Promise<void> {
@@ -283,7 +298,7 @@ async function searchWorkspaceSymbols(
           const content = await readFile(full, 'utf-8');
           const symbols = extractSymbols(content);
           for (const sym of symbols) {
-            if (sym.name.toLowerCase().includes(query.toLowerCase())) {
+            if (sym.name.toLowerCase().includes(sanitizedQuery.toLowerCase())) {
               results.push({ ...sym, file: relative(dir, full) });
             }
           }
@@ -434,7 +449,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     case 'lsp_diagnostics': {
       const file = a.file as string;
       if (!file) return errorResult('file is required');
-      const dir = join(file, '..');
+      const validatedFile = validateFilePath(file, process.cwd());
+      const dir = join(validatedFile, '..');
       // Walk up to find project root (where tsconfig.json is)
       let projectDir = dir;
       for (let i = 0; i < 10; i++) {
@@ -443,9 +459,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (parent === projectDir) break;
         projectDir = parent;
       }
-      const result = await runTscDiagnostics(file, projectDir, a.severity as string);
+      const result = await runTscDiagnostics(validatedFile, projectDir, a.severity as string);
       return text({
-        file,
+        file: validatedFile,
         diagnosticCount: result.diagnostics.length,
         diagnostics: result.diagnostics,
         command: result.command,
@@ -486,6 +502,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const query = a.query as string;
       const file = a.file as string;
       if (!query) return errorResult('query is required');
+      const sanitizedQuery = sanitizeSymbolName(query);
+      if (!sanitizedQuery) return errorResult('query is empty after sanitization');
       // Determine project root from file
       let dir = file ? join(file, '..') : process.cwd();
       for (let i = 0; i < 10; i++) {
@@ -494,8 +512,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (parent === dir) break;
         dir = parent;
       }
-      const symbols = await searchWorkspaceSymbols(query, dir);
-      return text({ query, resultCount: symbols.length, symbols });
+      const symbols = await searchWorkspaceSymbols(sanitizedQuery, dir);
+      return text({ query: sanitizedQuery, resultCount: symbols.length, symbols });
     }
 
     case 'lsp_hover': {
@@ -539,7 +557,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       while (start > 0 && /\w/.test(targetLine[start - 1])) start--;
       while (end < targetLine.length && /\w/.test(targetLine[end])) end++;
       const symbol = targetLine.slice(start, end);
-      if (!symbol) return errorResult('Could not identify symbol at position');
+      const sanitizedSymbol = sanitizeSymbolName(symbol);
+      if (!sanitizedSymbol) return errorResult('Could not identify symbol at position');
 
       // Use grep to find references
       let dir = join(file, '..');
@@ -553,7 +572,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const { stdout } = await exec('grep', [
           '-rn', '--include=*.ts', '--include=*.tsx', '--include=*.js', '--include=*.jsx',
           '--include=*.py', '--include=*.go', '--include=*.rs',
-          '-w', symbol, dir,
+          '-w', sanitizedSymbol, dir,
         ], { timeout: 15000 });
         const refs = stdout.split('\n').filter(Boolean).map(line => {
           const match = line.match(/^(.+?):(\d+):(.+)$/);
@@ -563,7 +582,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         const declarationLines = new Set(
           extractSymbols(content)
-            .filter((s) => s.name === symbol)
+            .filter((s) => s.name === sanitizedSymbol)
             .map((s) => s.line)
         );
         const normalizedTargetFile = resolve(file);
@@ -575,14 +594,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           });
 
         return text({
-          symbol,
+          symbol: sanitizedSymbol,
           includeDeclaration: effectiveIncludeDeclaration,
           referenceCount: filteredRefs.length,
           references: filteredRefs.slice(0, 100),
         });
       } catch {
         return text({
-          symbol,
+          symbol: sanitizedSymbol,
           includeDeclaration: effectiveIncludeDeclaration,
           referenceCount: 0,
           references: [],
