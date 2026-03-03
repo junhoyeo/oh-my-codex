@@ -34,25 +34,6 @@ function compareTraceTimestamp(a: TraceEntry, b: TraceEntry): number {
   return (a.timestamp || '').localeCompare(b.timestamp || '');
 }
 
-function keepLastEntries(entries: TraceEntry[], entry: TraceEntry, limit: number): void {
-  if (limit <= 0) return;
-
-  if (entries.length < limit) {
-    entries.push(entry);
-    entries.sort(compareTraceTimestamp);
-    return;
-  }
-
-  if (compareTraceTimestamp(entry, entries[0]) <= 0) return;
-
-  entries[0] = entry;
-  let i = 0;
-  while (i + 1 < entries.length && compareTraceTimestamp(entries[i], entries[i + 1]) > 0) {
-    [entries[i], entries[i + 1]] = [entries[i + 1], entries[i]];
-    i++;
-  }
-}
-
 async function* iterateLogEntries(logsDir: string): AsyncGenerator<TraceEntry> {
   if (!existsSync(logsDir)) return;
 
@@ -61,8 +42,14 @@ async function* iterateLogEntries(logsDir: string): AsyncGenerator<TraceEntry> {
     .sort();
 
   for (const file of files) {
+    const stream = createReadStream(join(logsDir, file), { encoding: 'utf-8' });
+    stream.on('error', (err) => {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        console.error(`[trace-server] Error reading log file ${file}:`, err.message);
+      }
+    });
     const rl = createInterface({
-      input: createReadStream(join(logsDir, file), { encoding: 'utf-8' }),
+      input: stream,
       crlfDelay: Infinity,
     });
 
@@ -76,21 +63,14 @@ async function* iterateLogEntries(logsDir: string): AsyncGenerator<TraceEntry> {
 }
 
 export async function readLogFiles(logsDir: string, last?: number): Promise<TraceEntry[]> {
-  if (last && last > 0) {
-    const entries: TraceEntry[] = [];
-    for await (const entry of iterateLogEntries(logsDir)) {
-      keepLastEntries(entries, entry, last);
-    }
-    return entries;
-  }
-
+  const effectiveLast = last ?? 1000;
   const entries: TraceEntry[] = [];
   for await (const entry of iterateLogEntries(logsDir)) {
     entries.push(entry);
   }
 
   entries.sort(compareTraceTimestamp);
-  return entries;
+  return effectiveLast < entries.length ? entries.slice(-effectiveLast) : entries;
 }
 
 interface LogSummary {
@@ -331,5 +311,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
 if (shouldAutoStartMcpServer('trace')) {
   const transport = new StdioServerTransport();
-  server.connect(transport).catch(console.error);
+  server.connect(transport).catch((err) => {
+    console.error('MCP server failed to connect:', err);
+    process.exit(1);
+  });
 }

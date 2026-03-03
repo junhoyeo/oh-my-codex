@@ -118,6 +118,18 @@ const TEAM_UPDATE_TASK_MUTABLE_FIELDS = new Set(['subject', 'description', 'bloc
 const TEAM_UPDATE_TASK_REQUEST_FIELDS = new Set(['team_name', 'task_id', 'workingDirectory', ...TEAM_UPDATE_TASK_MUTABLE_FIELDS]);
 const stateWriteQueues = new Map<string, Promise<void>>();
 
+interface StateCache {
+  data: Map<string, unknown>;
+  timestamp: number;
+}
+
+const stateCache: StateCache = { data: new Map(), timestamp: 0 };
+const STATE_CACHE_TTL_MS = 500;
+
+function invalidateStateCache(): void {
+  stateCache.timestamp = 0;
+}
+
 async function withStateWriteLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
   const tail = stateWriteQueues.get(path) ?? Promise.resolve();
   let release!: () => void;
@@ -879,6 +891,7 @@ export async function handleStateToolCall(request: {
           isError: true,
         };
       }
+      invalidateStateCache();
       return { content: [{ type: 'text', text: JSON.stringify({ success: true, mode, path }) }] };
     }
 
@@ -891,6 +904,7 @@ export async function handleStateToolCall(request: {
         if (existsSync(path)) {
           await unlink(path);
         }
+        invalidateStateCache();
         return { content: [{ type: 'text', text: JSON.stringify({ cleared: true, mode, path }) }] };
       }
 
@@ -901,6 +915,8 @@ export async function handleStateToolCall(request: {
         await unlink(path);
         removedPaths.push(path);
       }
+
+      invalidateStateCache();
 
       return {
         content: [{
@@ -918,9 +934,18 @@ export async function handleStateToolCall(request: {
     }
 
     case 'state_list_active': {
+      const now = Date.now();
+      if (now - stateCache.timestamp < STATE_CACHE_TTL_MS && stateCache.data.size > 0) {
+        const cachedActive = [...stateCache.data.entries()]
+          .filter(([, data]) => Boolean((data as { active?: unknown }).active))
+          .map(([mode]) => mode);
+        return { content: [{ type: 'text', text: JSON.stringify({ active_modes: cachedActive }) }] };
+      }
+
       const stateDirs = await getReadScopedStateDirs(cwd, explicitSessionId);
       const active: string[] = [];
       const seenModes = new Set<string>();
+      const parsedResults = new Map<string, unknown>();
       for (const stateDir of stateDirs) {
         if (!existsSync(stateDir)) continue;
         const files = await readdir(stateDir);
@@ -931,12 +956,15 @@ export async function handleStateToolCall(request: {
           seenModes.add(mode);
           try {
             const data = JSON.parse(await readFile(join(stateDir, f), 'utf-8'));
+            parsedResults.set(mode, data);
             if (data.active) {
               active.push(mode);
             }
           } catch { /* skip malformed */ }
         }
       }
+      stateCache.data = parsedResults;
+      stateCache.timestamp = Date.now();
       return { content: [{ type: 'text', text: JSON.stringify({ active_modes: active }) }] };
     }
 
@@ -1452,5 +1480,8 @@ server.setRequestHandler(CallToolRequestSchema, handleStateToolCall);
 // Start server
 if (shouldAutoStartMcpServer('state')) {
   const transport = new StdioServerTransport();
-  server.connect(transport).catch(console.error);
+  server.connect(transport).catch((err) => {
+    console.error('MCP server failed to connect:', err);
+    process.exit(1);
+  });
 }

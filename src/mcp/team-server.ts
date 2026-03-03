@@ -10,8 +10,8 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
-import { readFile } from 'fs/promises';
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { readFile, writeFile } from 'fs/promises';
+import { existsSync, mkdirSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { spawn } from 'child_process';
@@ -59,6 +59,7 @@ interface OmxTeamJob {
   result?: string;
   stderr?: string;
   startedAt: number;
+  completedAt?: number;
   pid?: number;
   paneIds?: string[];
   leaderPaneId?: string;
@@ -69,17 +70,43 @@ interface OmxTeamJob {
 
 const omxTeamJobs = new Map<string, OmxTeamJob>();
 const OMX_JOBS_DIR = join(homedir(), '.omx', 'team-jobs');
+const JOB_TTL_MS = 60 * 60 * 1000;
+const MAX_JOBS = 100;
 
-function persistJob(jobId: string, job: OmxTeamJob): void {
+function evictStaleJobs(): void {
+  const now = Date.now();
+  for (const [id, job] of omxTeamJobs) {
+    if ((job.status === 'completed' || job.status === 'failed')
+      && now - (job.completedAt ?? job.startedAt ?? 0) > JOB_TTL_MS) {
+      omxTeamJobs.delete(id);
+    }
+  }
+
+  if (omxTeamJobs.size > MAX_JOBS) {
+    const completed = [...omxTeamJobs.entries()]
+      .filter(([, job]) => job.status === 'completed' || job.status === 'failed')
+      .sort((a, b) => (a[1].completedAt ?? 0) - (b[1].completedAt ?? 0));
+    for (const [id] of completed) {
+      if (omxTeamJobs.size <= MAX_JOBS) break;
+      omxTeamJobs.delete(id);
+    }
+  }
+}
+
+async function persistJob(jobId: string, job: OmxTeamJob): Promise<void> {
   try {
     if (!existsSync(OMX_JOBS_DIR)) mkdirSync(OMX_JOBS_DIR, { recursive: true });
-    writeFileSync(join(OMX_JOBS_DIR, `${jobId}.json`), JSON.stringify(job), 'utf-8');
+    await writeFile(join(OMX_JOBS_DIR, `${jobId}.json`), JSON.stringify(job), 'utf-8');
   } catch { /* best-effort */ }
 }
 
-function loadJobFromDisk(jobId: string): OmxTeamJob | undefined {
+async function loadJobFromDisk(jobId: string): Promise<OmxTeamJob | undefined> {
+  const cached = omxTeamJobs.get(jobId);
+  if (cached) return cached;
   try {
-    return JSON.parse(readFileSync(join(OMX_JOBS_DIR, `${jobId}.json`), 'utf-8')) as OmxTeamJob;
+    const loaded = JSON.parse(await readFile(join(OMX_JOBS_DIR, `${jobId}.json`), 'utf-8')) as OmxTeamJob;
+    omxTeamJobs.set(jobId, loaded);
+    return loaded;
   } catch { return undefined; }
 }
 
@@ -286,6 +313,7 @@ export async function handleTeamToolCall(request: {
   try {
     switch (name) {
       case 'omx_run_team_start': {
+        evictStaleJobs();
         const { teamName, agentTypes, tasks, cwd: inputCwd } = startSchema.parse(a);
 
         const jobId = `omx-${Date.now().toString(36)}`;
@@ -299,7 +327,7 @@ export async function handleTeamToolCall(request: {
           stdio: ['pipe', 'pipe', 'pipe'],
         });
         job.pid = child.pid;
-        persistJob(jobId, job);
+        void persistJob(jobId, job);
 
         child.stdin.write(JSON.stringify({ teamName, agentTypes, tasks, cwd: inputCwd }));
         child.stdin.end();
@@ -328,14 +356,18 @@ export async function handleTeamToolCall(request: {
             if (code === 0) job.status = 'completed';
             else job.status = 'failed';
           }
+          if (job.status === 'completed' || job.status === 'failed') {
+            job.completedAt = Date.now();
+          }
           if (stderr) job.stderr = stderr;
-          persistJob(jobId, job);
+          void persistJob(jobId, job);
         });
 
         child.on('error', (err: Error) => {
           job.status = 'failed';
+          job.completedAt = Date.now();
           job.stderr = `spawn error: ${err.message}`;
-          persistJob(jobId, job);
+          void persistJob(jobId, job);
         });
 
         return {
@@ -344,8 +376,9 @@ export async function handleTeamToolCall(request: {
       }
 
       case 'omx_run_team_status': {
+        evictStaleJobs();
         const { job_id: jobId } = statusSchema.parse(a);
-        const job = omxTeamJobs.get(jobId) ?? loadJobFromDisk(jobId);
+        const job = omxTeamJobs.get(jobId) ?? await loadJobFromDisk(jobId);
         if (!job) {
           return { content: [{ type: 'text' as const, text: JSON.stringify({ error: `No job found: ${jobId}` }) }] };
         }
@@ -357,6 +390,7 @@ export async function handleTeamToolCall(request: {
       }
 
       case 'omx_run_team_wait': {
+        evictStaleJobs();
         const { job_id: jobId, timeout_ms: timeoutMs, nudge_delay_ms: nudgeDelayMs, nudge_max_count: nudgeMaxCount, nudge_message: nudgeMessage } = waitSchema.parse(a);
 
         const deadline = Date.now() + Math.min(timeoutMs, 3_600_000);
@@ -369,7 +403,7 @@ export async function handleTeamToolCall(request: {
         });
 
         while (Date.now() < deadline) {
-          const job = omxTeamJobs.get(jobId) ?? loadJobFromDisk(jobId);
+          const job = omxTeamJobs.get(jobId) ?? await loadJobFromDisk(jobId);
           if (!job) {
             return { content: [{ type: 'text' as const, text: JSON.stringify({ error: `No job found: ${jobId}` }) }] };
           }
@@ -381,8 +415,9 @@ export async function handleTeamToolCall(request: {
             } catch (e: unknown) {
               if ((e as NodeJS.ErrnoException).code === 'ESRCH') {
                 job.status = 'failed';
+                job.completedAt = Date.now();
                 if (!job.result) job.result = JSON.stringify({ error: 'Process no longer alive (MCP restart?)' });
-                persistJob(jobId, job);
+                await persistJob(jobId, job);
                 const elapsed = ((Date.now() - job.startedAt) / 1000).toFixed(1);
                 return { content: [{ type: 'text' as const, text: JSON.stringify({ jobId, status: 'failed', elapsedSeconds: elapsed, error: 'Process no longer alive (MCP restart?)' }) }] };
               }
@@ -426,8 +461,9 @@ export async function handleTeamToolCall(request: {
       }
 
       case 'omx_run_team_cleanup': {
+        evictStaleJobs();
         const { job_id: jobId, grace_ms: graceMs } = cleanupSchema.parse(a);
-        const job = omxTeamJobs.get(jobId) ?? loadJobFromDisk(jobId);
+        const job = omxTeamJobs.get(jobId) ?? await loadJobFromDisk(jobId);
         if (!job) return { content: [{ type: 'text' as const, text: `Job ${jobId} not found` }] };
         const selected = await resolveCleanupTargets(jobId, job);
         const cleanedUpAt = new Date().toISOString();
@@ -465,7 +501,7 @@ export async function handleTeamToolCall(request: {
           cleaned_up_at: cleanedUpAt,
         };
         job.cleanedUpAt = cleanedUpAt;
-        persistJob(jobId, job);
+        await persistJob(jobId, job);
         return {
           content: [
             {
@@ -494,5 +530,8 @@ server.setRequestHandler(CallToolRequestSchema, handleTeamToolCall);
 
 if (shouldAutoStartMcpServer('team')) {
   const transport = new StdioServerTransport();
-  server.connect(transport).catch(console.error);
+  server.connect(transport).catch((err) => {
+    console.error('MCP server failed to connect:', err);
+    process.exit(1);
+  });
 }

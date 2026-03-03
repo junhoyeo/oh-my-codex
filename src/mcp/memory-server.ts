@@ -406,5 +406,8 @@ function appendToSection(content: string, section: string, entry: string): strin
 
 if (shouldAutoStartMcpServer('memory')) {
   const transport = new StdioServerTransport();
-  server.connect(transport).catch(console.error);
+  server.connect(transport).catch((err) => {
+    console.error('MCP server failed to connect:', err);
+    process.exit(1);
+  });
 }
