@@ -4,13 +4,40 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-03-04
+
+Generated from `v0.7.6..dev` (non-merge commits) and release validation on `dev`.
+
 ### Added
 - New canonical provider advisor command: `omx ask <claude|gemini> "<prompt>"`.
+- Ouroboros-inspired ambiguity-gated deep interview workflow (`$deep-interview`) for requirement clarification.
+- Required pre-context intake gates for execution-heavy flows (autopilot, ralph, team, ralplan, and deep-interview preflight).
+- New `$web-clone` skill for URL-driven website cloning and verification loops.
+- Built-in `ask-claude` and `ask-gemini` skills in the catalog.
+- Visual-verdict feedback loop support for visual Ralph iterations.
 
 ### Changed
+- Bumped package version to `0.8.0`.
 - `ask-claude` and `ask-gemini` skill guidance now routes to canonical `omx ask ...` usage.
 - Ask docs/CLI parsing now explicitly align with provider help flags (`claude --print|-p`, `gemini --prompt|-p`).
 - Legacy wrapper/npm script entrypoints remain available as transitional compatibility paths with migration hints.
+- Refactored team state facade into bounded modules and extracted canonical state-root resolution.
+- Improved CLI behavior around `omx ralph --prd`, `--version` routing, and PRD-focused help guidance.
+- Hardened runtime quality/performance/concurrency paths (dispatch polling backoff, notepad atomicity, scaling rollback, shutdown guards).
+
+### Fixed
+- Closed multiple security issues (including shell-injection vector replacement and security hardening sweep).
+- Fixed launch worktree reuse to gracefully handle pre-existing paths.
+- Fixed team claim lifecycle contract enforcement (`releaseTaskClaim` token validation) and worker bootstrap lifecycle docs.
+- Fixed `writeAtomic` ENOENT masking behavior and team rebase/typecheck regressions.
+- Fixed onboarding warning copy clarity in `omx doctor`.
+- Fixed missing pre-context gate text for team/ralplan skill docs.
+
+### CI / Test / Docs
+- Added Node `20/22` CI matrix for core checks.
+- Added required CI lint gate and team/state coverage gate with reporting.
+- Expanded tests for idle nudge branch/throttle behavior and team ops contracts.
+- Completed multilingual README translations for all 12 languages.
 
 ## [0.7.6] - 2026-03-02
 
