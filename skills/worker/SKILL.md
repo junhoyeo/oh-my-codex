@@ -71,6 +71,14 @@ Use CLI interop:
 - `omx team api mailbox-list --json` to read
 - `omx team api mailbox-mark-delivered --json` to acknowledge delivery
 
+## Dispatch Discipline (state-first)
+
+Worker sessions should treat team state + CLI interop as the source of truth.
+
+- Prefer inbox/mailbox/task state and `omx team api ... --json` operations.
+- Do **not** rely on ad-hoc tmux keystrokes as a primary delivery channel.
+- If a manual trigger arrives (for example `tmux send-keys` nudge), treat it only as a prompt to re-check state and continue through the normal claim-safe lifecycle.
+
 ## Shutdown
 
 If the lead sends a shutdown request, follow the shutdown inbox instructions exactly, write your shutdown ack file, then exit the Codex session.

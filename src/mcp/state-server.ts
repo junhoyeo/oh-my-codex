@@ -11,8 +11,8 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import { readFile, writeFile, readdir, mkdir, unlink, rename } from 'fs/promises';
-import { existsSync, readFileSync } from 'fs';
-import { dirname, join, resolve as resolvePath } from 'path';
+import { existsSync } from 'fs';
+import { join } from 'path';
 import {
   getAllScopedStatePaths,
   getReadScopedStateDirs,
@@ -29,8 +29,6 @@ import { ensureCanonicalRalphArtifacts } from '../ralph/persistence.js';
 import { shouldAutoStartMcpServer } from './bootstrap.js';
 import { LEGACY_TEAM_MCP_TOOLS, buildLegacyTeamDeprecationHint } from '../team/api-interop.js';
 import {
-  TEAM_NAME_SAFE_PATTERN,
-  WORKER_NAME_SAFE_PATTERN,
   TASK_ID_SAFE_PATTERN,
   TEAM_TASK_STATUSES,
   TEAM_EVENT_TYPES,
@@ -142,91 +140,6 @@ function parseValidatedTaskIdArray(value: unknown, fieldName: string): string[] 
     taskIds.push(normalized);
   }
   return taskIds;
-}
-
-function teamStateExists(teamName: string, candidateCwd: string): boolean {
-  if (!TEAM_NAME_SAFE_PATTERN.test(teamName)) return false;
-  const teamRoot = join(candidateCwd, '.omx', 'state', 'team', teamName);
-  return (
-    existsSync(join(teamRoot, 'config.json')) ||
-    existsSync(join(teamRoot, 'tasks')) ||
-    existsSync(teamRoot)
-  );
-}
-
-function parseTeamWorkerEnv(raw: string | undefined): { teamName: string; workerName: string } | null {
-  if (typeof raw !== 'string' || raw.trim() === '') return null;
-  const match = /^([a-z0-9][a-z0-9-]{0,29})\/(worker-\d+)$/.exec(raw.trim());
-  if (!match) return null;
-  return { teamName: match[1], workerName: match[2] };
-}
-
-function readTeamStateRootFromFile(path: string): string | null {
-  if (!existsSync(path)) return null;
-  try {
-    const parsed = JSON.parse(readFileSync(path, 'utf8')) as { team_state_root?: unknown };
-    return typeof parsed.team_state_root === 'string' && parsed.team_state_root.trim() !== ''
-      ? parsed.team_state_root.trim()
-      : null;
-  } catch {
-    return null;
-  }
-}
-
-function stateRootToWorkingDirectory(stateRoot: string): string {
-  const absolute = resolvePath(stateRoot);
-  return dirname(dirname(absolute));
-}
-
-function resolveTeamWorkingDirectoryFromMetadata(
-  teamName: string,
-  candidateCwd: string,
-  workerContext: { teamName: string; workerName: string } | null,
-): string | null {
-  const teamRoot = join(candidateCwd, '.omx', 'state', 'team', teamName);
-  if (!existsSync(teamRoot)) return null;
-
-  if (workerContext?.teamName === teamName) {
-    const workerRoot = readTeamStateRootFromFile(join(teamRoot, 'workers', workerContext.workerName, 'identity.json'));
-    if (workerRoot) return stateRootToWorkingDirectory(workerRoot);
-  }
-
-  const fromManifest = readTeamStateRootFromFile(join(teamRoot, 'manifest.v2.json'));
-  if (fromManifest) return stateRootToWorkingDirectory(fromManifest);
-
-  const fromConfig = readTeamStateRootFromFile(join(teamRoot, 'config.json'));
-  if (fromConfig) return stateRootToWorkingDirectory(fromConfig);
-
-  return null;
-}
-
-function resolveTeamWorkingDirectory(teamName: string, preferredCwd: string): string {
-  const normalizedTeamName = String(teamName || '').trim();
-  if (!normalizedTeamName) return preferredCwd;
-  const envTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
-  if (typeof envTeamStateRoot === 'string' && envTeamStateRoot.trim() !== '') {
-    return stateRootToWorkingDirectory(envTeamStateRoot.trim());
-  }
-
-  const seeds: string[] = [];
-  for (const seed of [preferredCwd, process.cwd()]) {
-    if (typeof seed !== 'string' || seed.trim() === '') continue;
-    if (!seeds.includes(seed)) seeds.push(seed);
-  }
-
-  const workerContext = parseTeamWorkerEnv(process.env.OMX_TEAM_WORKER);
-  for (const seed of seeds) {
-    let cursor = seed;
-    while (cursor) {
-      if (teamStateExists(normalizedTeamName, cursor)) {
-        return resolveTeamWorkingDirectoryFromMetadata(normalizedTeamName, cursor, workerContext) ?? cursor;
-      }
-      const parent = dirname(cursor);
-      if (!parent || parent === cursor) break;
-      cursor = parent;
-    }
-  }
-  return preferredCwd;
 }
 
 const server = new Server(
