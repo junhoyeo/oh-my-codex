@@ -93,13 +93,21 @@ function buildCmdLaunch(commandPath: string, args: string[], env: NodeJS.Process
   const commandLine = [commandPath, ...args].map(quoteForCmd).join(' ');
   return {
     command: env.ComSpec || 'cmd.exe',
-    args: ['/d', '/s', '/c', commandLine],
+    args: ['/d', '/s', '/c', `"${commandLine}"`],
     resolvedPath: commandPath,
   };
 }
 
 function resolvePowerShellExecutable(env: NodeJS.ProcessEnv, existsImpl: ExistsSyncLike): string {
   return resolveWindowsCommandPath('powershell', env, existsImpl) || 'powershell.exe';
+}
+
+function shouldUseWindowsVerbatimArguments(platform: NodeJS.Platform, spec: PlatformCommandSpec): boolean {
+  return (
+    platform === 'win32' &&
+    typeof spec.resolvedPath === 'string' &&
+    classifyWindowsCommandPath(spec.resolvedPath) === 'cmd'
+  );
 }
 
 export function classifySpawnError(error: NodeJS.ErrnoException | undefined | null): SpawnErrorKind | null {
@@ -165,6 +173,9 @@ export function spawnPlatformCommandSync(
   spawnImpl: SpawnSyncLike = spawnSync,
 ): ProbedPlatformCommand {
   const spec = buildPlatformCommandSpec(command, args, platform, env, existsImpl);
-  const result = spawnImpl(spec.command, spec.args, options);
+  const spawnOptions = shouldUseWindowsVerbatimArguments(platform, spec)
+    ? { ...options, windowsVerbatimArguments: true }
+    : options;
+  const result = spawnImpl(spec.command, spec.args, spawnOptions);
   return { spec, result };
 }
