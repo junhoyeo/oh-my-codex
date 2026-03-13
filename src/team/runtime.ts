@@ -1343,7 +1343,19 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
       hudPaneId,
     });
 
-    // 4. Destroy tmux session
+    // 4. Restore tmux state before destroying session (closes #817)
+    if (process.env.OMX_TEAM_MOUSE !== '0') {
+      try {
+        const { loadSnapshotFromTmux, restoreTmuxState, clearSavedSnapshot } = await import('./tmux-state-manager.js');
+        const snapshot = loadSnapshotFromTmux();
+        if (snapshot) {
+          restoreTmuxState(snapshot);
+          clearSavedSnapshot();
+        }
+      } catch { /* ignore */ }
+    }
+
+    // 5. Destroy tmux session
     if (!sessionName.includes(':')) {
       try { destroyTeamSession(sessionName); } catch { /* ignore */ }
     }
@@ -1366,11 +1378,11 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
     }
   }
 
-  // 5. Remove team-scoped worker instructions file (no mutation of project AGENTS.md)
+  // 6. Remove team-scoped worker instructions file (no mutation of project AGENTS.md)
   try { await removeTeamWorkerInstructionsFile(sanitized, cwd); } catch { /* ignore */ }
   restoreTeamModelInstructionsFile(sanitized);
 
-  // 6. Ralph stricter completion logging
+  // 7. Ralph stricter completion logging
   if (ralph) {
     const finalTasks = await listTasks(sanitized, cwd).catch(() => [] as Awaited<ReturnType<typeof listTasks>>);
     const completed = finalTasks.filter((t) => t.status === 'completed').length;

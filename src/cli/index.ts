@@ -46,6 +46,13 @@ import {
   isNativeWindows,
   isWsl2,
 } from '../team/tmux-session.js';
+import {
+  captureTmuxState,
+  restoreTmuxState,
+  saveSnapshotToTmux,
+  loadSnapshotFromTmux,
+  clearSavedSnapshot,
+} from '../team/tmux-state-manager.js';
 import { getPackageRoot } from '../utils/package.js';
 import { codexConfigPath } from '../utils/paths.js';
 import { HUD_TMUX_HEIGHT_LINES } from '../hud/constants.js';
@@ -1015,6 +1022,7 @@ function runCodex(
     // Enable mouse scrolling at session start so scroll works before team
     // expansion. Previously this was only called from createTeamSession().
     // Opt-out: set OMX_MOUSE=0. (closes #128)
+    // Save state before modification to restore on exit (closes #817)
     if (process.env.OMX_MOUSE !== '0') {
       try {
         const tmuxPaneTarget = process.env.TMUX_PANE;
@@ -1022,7 +1030,14 @@ function runCodex(
           ? ['display-message', '-p', '-t', tmuxPaneTarget, '#S']
           : ['display-message', '-p', '#S'];
         const tmuxSession = execFileSync('tmux', displayArgs, { encoding: 'utf-8' }).trim();
-        if (tmuxSession) enableMouseScrolling(tmuxSession);
+        if (tmuxSession) {
+          // Capture current state before modification
+          const snapshot = captureTmuxState(tmuxSession);
+          if (snapshot) {
+            saveSnapshotToTmux(snapshot);
+          }
+          enableMouseScrolling(tmuxSession);
+        }
       } catch {
         // Non-fatal: mouse scrolling is a convenience feature
       }
@@ -1038,6 +1053,19 @@ function runCodex(
       );
       for (const paneId of cleanupPaneIds) {
         killTmuxPane(paneId);
+      }
+      
+      // Restore tmux state after OMX exit (closes #817)
+      if (process.env.OMX_MOUSE !== '0') {
+        try {
+          const snapshot = loadSnapshotFromTmux();
+          if (snapshot) {
+            restoreTmuxState(snapshot);
+            clearSavedSnapshot();
+          }
+        } catch {
+          // Non-fatal: state restoration is best-effort
+        }
       }
     }
   } else {

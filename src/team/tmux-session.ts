@@ -850,7 +850,13 @@ export function createTeamSession(
     // mouse wheel without conflicting with keyboard up/down arrow-key input
     // history navigation in the Codex CLI input field. (issue #103)
     // Opt-out: set OMX_TEAM_MOUSE=0 in the environment.
+    // Save state before modification to restore on exit (closes #817)
     if (process.env.OMX_TEAM_MOUSE !== '0') {
+      const { captureTmuxState, saveSnapshotToTmux } = await import('./tmux-state-manager.js');
+      const snapshot = captureTmuxState(sessionName);
+      if (snapshot) {
+        saveSnapshotToTmux(snapshot);
+      }
       enableMouseScrolling(sessionName);
     }
 
