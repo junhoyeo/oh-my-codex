@@ -58,4 +58,21 @@ describe('catalog schema', () => {
     assert.ok(counts.activeSkillCount > 0);
     assert.ok(counts.activeAgentCount > 0);
   });
+
+  it('includes ask-claude and ask-gemini as active built-in skills', () => {
+    const parsed = validateCatalogManifest(readSourceManifest());
+    const askClaude = parsed.skills.find((skill) => skill.name === 'ask-claude');
+    const askGemini = parsed.skills.find((skill) => skill.name === 'ask-gemini');
+
+    assert.equal(askClaude?.status, 'active');
+    assert.equal(askGemini?.status, 'active');
+  });
+
+  it('includes ai-slop-cleaner as an active built-in skill', () => {
+    const parsed = validateCatalogManifest(readSourceManifest());
+    const aiSlopCleaner = parsed.skills.find((skill) => skill.name === 'ai-slop-cleaner');
+
+    assert.equal(aiSlopCleaner?.category, 'shortcut');
+    assert.equal(aiSlopCleaner?.status, 'active');
+  });
 });

@@ -31,6 +31,10 @@ Deep investigation requires a different approach than quick lookups or code chan
 - Fall back to architect agent when Codex is unavailable
 - Always provide context files to the analysis tool for grounded reasoning
 - Return structured findings, not just raw observations
+- Default to concise, evidence-dense progress and completion reporting unless the user or risk level requires more detail
+- Treat newer user task updates as local overrides for the active workflow branch while preserving earlier non-conflicting constraints
+- If correctness depends on additional inspection, retrieval, execution, or verification, keep using the relevant tools until the analysis is grounded
+- Continue through clear, low-risk, reversible next steps automatically; ask only when the next step is materially branching, destructive, or preference-dependent
 </Execution_Policy>
 
 <Steps>
@@ -38,7 +42,7 @@ Deep investigation requires a different approach than quick lookups or code chan
 2. **Gather relevant context**: Read or identify the key files involved
 3. **Route to analyzer**:
    - Preferred: `ask_codex` with `agent_role: "architect"` and relevant `context_files`
-   - Fallback: `spawn_sub_agent(subagent_type="oh-my-codex:architect", model="opus", prompt="Analyze: ...")`
+   - Fallback: delegate to the `architect` role at THOROUGH tier with the analysis request
 4. **Return structured findings**: Present the analysis with evidence, file references, and actionable recommendations
 </Steps>
 
@@ -46,9 +50,18 @@ Deep investigation requires a different approach than quick lookups or code chan
 - Before first MCP tool use, call `ToolSearch("mcp")` to discover deferred MCP tools
 - Use `ask_codex` with `agent_role: "architect"` as the preferred analysis route
 - Pass `context_files` with all relevant source files for grounded analysis
-- Use `spawn_sub_agent(subagent_type="oh-my-codex:architect", model="opus", ...)` as fallback when ToolSearch finds no MCP tools or Codex is unavailable
+- Use the `architect` role as fallback when ToolSearch finds no MCP tools or Codex is unavailable
 - For broad analysis, use `explore` agent first to identify relevant files before routing to architect
 </Tool_Usage>
+
+
+## Scenario Examples
+
+**Good:** The user says `continue` after the workflow already has a clear next step. Continue the current branch of work instead of restarting or re-asking the same question.
+
+**Good:** The user changes only the output shape or downstream delivery step (for example `make a PR`). Preserve earlier non-conflicting workflow constraints and apply the update locally.
+
+**Bad:** The user says `continue`, and the workflow restarts discovery or stops before the missing verification/evidence is gathered.
 
 <Examples>
 <Good>

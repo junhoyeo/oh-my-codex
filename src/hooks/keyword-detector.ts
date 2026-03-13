@@ -24,6 +24,16 @@ export interface KeywordMatch {
 
 export type SkillActivePhase = 'planning' | 'executing' | 'reviewing' | 'completing';
 
+export interface DeepInterviewInputLock {
+  active: boolean;
+  scope: 'deep-interview-auto-approval';
+  acquired_at: string;
+  released_at?: string;
+  exit_reason?: 'success' | 'error' | 'abort' | 'handoff';
+  blocked_inputs: string[];
+  message: string;
+}
+
 export interface SkillActiveState {
   version: 1;
   active: boolean;
@@ -36,6 +46,7 @@ export interface SkillActiveState {
   session_id?: string;
   thread_id?: string;
   turn_id?: string;
+  input_lock?: DeepInterviewInputLock;
 }
 
 export interface RecordSkillActivationInput {
@@ -48,6 +59,32 @@ export interface RecordSkillActivationInput {
 }
 
 export const SKILL_ACTIVE_STATE_FILE = 'skill-active-state.json';
+export const DEEP_INTERVIEW_BLOCKED_APPROVAL_INPUTS = ['yes', 'y', 'proceed', 'continue', 'ok', 'sure', 'go ahead', 'next i should'] as const;
+export const DEEP_INTERVIEW_INPUT_LOCK_MESSAGE = 'Deep interview is active; auto-approval shortcuts are blocked until the interview finishes.';
+
+function createDeepInterviewInputLock(nowIso: string, previous?: DeepInterviewInputLock): DeepInterviewInputLock {
+  return {
+    active: true,
+    scope: 'deep-interview-auto-approval',
+    acquired_at: previous?.active ? previous.acquired_at : nowIso,
+    blocked_inputs: [...DEEP_INTERVIEW_BLOCKED_APPROVAL_INPUTS],
+    message: DEEP_INTERVIEW_INPUT_LOCK_MESSAGE,
+  };
+}
+
+function releaseDeepInterviewInputLock(
+  previous: DeepInterviewInputLock | undefined,
+  nowIso: string,
+  reason: DeepInterviewInputLock['exit_reason'] = 'handoff',
+): DeepInterviewInputLock | undefined {
+  if (!previous) return undefined;
+  return {
+    ...previous,
+    active: false,
+    released_at: nowIso,
+    exit_reason: reason,
+  };
+}
 
 async function readExistingSkillState(statePath: string): Promise<SkillActiveState | null> {
   try {
@@ -98,6 +135,34 @@ const TEAM_SWARM_INTENT_PATTERNS: Record<'team' | 'swarm', RegExp[]> = {
   ],
 };
 
+function hasExplicitPromptsInvocation(text: string): boolean {
+  return /(?:^|\s)\/prompts:[\w.-]+(?=[\s.,!?;:]|$)/i.test(text);
+}
+
+function extractExplicitSkillInvocations(text: string): KeywordMatch[] {
+  const results: KeywordMatch[] = [];
+  const regex = /(?:^|[^\w])\$([a-z][a-z0-9-]*)\b/gi;
+  let match: RegExpExecArray | null;
+
+  while ((match = regex.exec(text)) !== null) {
+    const token = (match[1] ?? '').toLowerCase();
+    if (!token) continue;
+
+    const normalizedSkill = token === 'swarm' ? 'team' : token;
+    const registryEntry = KEYWORD_TRIGGER_DEFINITIONS.find((entry) => entry.skill.toLowerCase() === normalizedSkill);
+    if (!registryEntry) continue;
+    if (results.some((item) => item.skill === normalizedSkill)) continue;
+
+    results.push({
+      keyword: `$${token}`,
+      skill: normalizedSkill,
+      priority: registryEntry.priority,
+    });
+  }
+
+  return results;
+}
+
 function hasIntentContextForKeyword(text: string, keyword: string): boolean {
   if (!KEYWORDS_REQUIRING_INTENT.has(keyword.toLowerCase())) return true;
   const k = keyword.toLowerCase() as 'team' | 'swarm';
@@ -106,16 +171,22 @@ function hasIntentContextForKeyword(text: string, keyword: string): boolean {
 
 /**
  * Detect keywords in user input text
- * Returns matching skills sorted by priority (highest first)
+ * Returns explicit `$skill` matches first (left-to-right),
+ * then appends implicit keyword matches sorted by priority.
  */
 export function detectKeywords(text: string): KeywordMatch[] {
-  const matches: KeywordMatch[] = [];
+  const explicit = extractExplicitSkillInvocations(text);
+  if (hasExplicitPromptsInvocation(text) && explicit.length === 0) {
+    return [];
+  }
+
+  const implicit: KeywordMatch[] = [];
 
   for (const { pattern, skill, priority } of KEYWORD_MAP) {
     const match = text.match(pattern);
     if (match) {
       if (!hasIntentContextForKeyword(text, match[0].toLowerCase())) continue;
-      matches.push({
+      implicit.push({
         keyword: match[0],
         skill,
         priority,
@@ -123,7 +194,14 @@ export function detectKeywords(text: string): KeywordMatch[] {
     }
   }
 
-  return matches.sort(compareKeywordMatches);
+  const merged: KeywordMatch[] = [...explicit];
+  const sortedImplicit = implicit.sort(compareKeywordMatches);
+  for (const item of sortedImplicit) {
+    if (merged.some((existing) => existing.skill === item.skill)) continue;
+    merged.push(item);
+  }
+
+  return merged;
 }
 
 /**
@@ -141,8 +219,41 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
   const nowIso = input.nowIso ?? new Date().toISOString();
   const statePath = join(input.stateDir, SKILL_ACTIVE_STATE_FILE);
   const previous = await readExistingSkillState(statePath);
+  const hadDeepInterviewLock = previous?.skill === 'deep-interview' && previous?.input_lock?.active === true;
+  const matches = detectKeywords(input.text);
+  const hasCancelIntent = matches.some((entry) => entry.skill === 'cancel');
+
+  if (hasCancelIntent && hadDeepInterviewLock) {
+    const state: SkillActiveState = {
+      version: 1,
+      active: false,
+      skill: 'deep-interview',
+      keyword: previous?.keyword || 'deep interview',
+      phase: 'completing',
+      activated_at: previous?.activated_at || nowIso,
+      updated_at: nowIso,
+      source: 'keyword-detector',
+      session_id: input.sessionId ?? previous?.session_id,
+      thread_id: input.threadId ?? previous?.thread_id,
+      turn_id: input.turnId ?? previous?.turn_id,
+      ...(previous?.input_lock ? { input_lock: releaseDeepInterviewInputLock(previous.input_lock, nowIso, 'abort') } : {}),
+    };
+
+    try {
+      await writeFile(statePath, JSON.stringify(state, null, 2));
+    } catch (error) {
+      console.warn('[omx] warning: failed to persist keyword activation state', error);
+    }
+
+    return state;
+  }
+
   const sameSkill = previous?.active === true && previous.skill === match.skill;
   const sameKeyword = previous?.keyword?.toLowerCase() === match.keyword.toLowerCase();
+
+  const deepInterviewInputLock = match.skill === 'deep-interview'
+    ? createDeepInterviewInputLock(nowIso, previous?.input_lock)
+    : releaseDeepInterviewInputLock(previous?.input_lock, nowIso);
 
   const state: SkillActiveState = {
     version: 1,
@@ -156,6 +267,7 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
     session_id: input.sessionId,
     thread_id: input.threadId,
     turn_id: input.turnId,
+    ...(deepInterviewInputLock ? { input_lock: deepInterviewInputLock } : {}),
   };
 
   try {

@@ -9,6 +9,13 @@ description: QA cycling workflow - test, verify, fix, repeat until goal met
 
 ## Overview
 
+## GPT-5.4 Guidance Alignment
+
+- Default to concise, evidence-dense progress and completion reporting unless the user or risk level requires more detail.
+- Treat newer user task updates as local overrides for the active workflow branch while preserving earlier non-conflicting constraints.
+- If correctness depends on additional inspection, retrieval, execution, or verification, keep using the relevant tools until the QA cycle is grounded.
+- Continue through clear, low-risk, reversible next steps automatically; ask only when the next step is materially branching, destructive, or preference-dependent.
+
 You are now in **ULTRAQA** mode - an autonomous QA cycling workflow that runs until your quality goal is met.
 
 **Cycle**: qa-tester → architect verification → fix → repeat
@@ -39,7 +46,7 @@ If no structured goal provided, interpret the argument as a custom goal.
    - `--custom`: Run appropriate command and check for pattern
    - `--interactive`: Use qa-tester for interactive CLI/service testing:
      ```
-     spawn_sub_agent(subagent_type="oh-my-codex:qa-tester", model="sonnet", prompt="TEST:
+     delegate(role="qa-tester", tier="STANDARD", task="TEST:
      Goal: [describe what to verify]
      Service: [how to start]
      Test cases: [specific scenarios to verify]")
@@ -51,7 +58,7 @@ If no structured goal provided, interpret the argument as a custom goal.
 
 3. **ARCHITECT DIAGNOSIS**: Spawn architect to analyze failure
    ```
-   spawn_sub_agent(subagent_type="oh-my-codex:architect", model="opus", prompt="DIAGNOSE FAILURE:
+   delegate(role="architect", tier="THOROUGH", task="DIAGNOSE FAILURE:
    Goal: [goal type]
    Output: [test/build output]
    Provide root cause and specific fix recommendations.")
@@ -59,7 +66,7 @@ If no structured goal provided, interpret the argument as a custom goal.
 
 4. **FIX ISSUES**: Apply architect's recommendations
    ```
-   spawn_sub_agent(subagent_type="oh-my-codex:executor", model="sonnet", prompt="FIX:
+   delegate(role="executor", tier="STANDARD", task="FIX:
    Issue: [architect diagnosis]
    Files: [affected files]
    Apply the fix precisely as recommended.")
@@ -104,6 +111,15 @@ Use `omx_state` MCP tools for UltraQA lifecycle state.
   `state_write({mode: "ultraqa", active: false, current_phase: "complete", completed_at: "<now>"})`
 - **For resume detection**:
   `state_read({mode: "ultraqa"})`
+
+
+## Scenario Examples
+
+**Good:** The user says `continue` after the workflow already has a clear next step. Continue the current branch of work instead of restarting or re-asking the same question.
+
+**Good:** The user changes only the output shape or downstream delivery step (for example `make a PR`). Preserve earlier non-conflicting workflow constraints and apply the update locally.
+
+**Bad:** The user says `continue`, and the workflow restarts discovery or stops before the missing verification/evidence is gathered.
 
 ## Cancellation
 

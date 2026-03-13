@@ -22,7 +22,7 @@ If ToolSearch finds no MCP tools, use the Codex agent fallback below.
 
 ### Fallback: Codex Agent
 ```
-spawn_sub_agent(subagent_type="oh-my-codex:designer", model="sonnet", prompt="{{ARGUMENTS}}")
+delegate(role="designer", tier="STANDARD", task="{{ARGUMENTS}}")
 ```
 
 ## Capabilities

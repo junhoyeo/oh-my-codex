@@ -2,7 +2,7 @@
  * Tests for OpenClaw gateway dispatcher.
  */
 
-import { describe, it, beforeEach, afterEach } from 'node:test';
+import { describe, it, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
@@ -10,6 +10,7 @@ import {
   shellEscapeArg,
   interpolateInstruction,
   isCommandGateway,
+  resolveCommandTimeoutMs,
 } from '../dispatcher.js';
 
 describe('validateGatewayUrl', () => {
@@ -70,14 +71,19 @@ describe('interpolateInstruction', () => {
     assert.equal(result, 'Session abc ended');
   });
 
-  it('leaves unknown variables as-is (not empty)', () => {
+  it('replaces unknown variables with empty string', () => {
     const result = interpolateInstruction('{{unknownVar}} text', {});
-    assert.equal(result, '{{unknownVar}} text');
+    assert.equal(result, ' text');
   });
 
-  it('leaves undefined variables as-is', () => {
+  it('replaces undefined variables with empty string', () => {
     const result = interpolateInstruction('{{sessionId}}', { sessionId: undefined });
-    assert.equal(result, '{{sessionId}}');
+    assert.equal(result, '');
+  });
+
+  it('replaces undefined tmuxSession with empty string', () => {
+    const result = interpolateInstruction('tmux:{{tmuxSession}}', { tmuxSession: undefined });
+    assert.equal(result, 'tmux:');
   });
 
   it('replaces multiple variables', () => {
@@ -105,12 +111,12 @@ describe('interpolateInstruction - reply context variables', () => {
     assert.equal(result, 'thread: thread-123');
   });
 
-  it('leaves reply variables as-is when undefined', () => {
+  it('replaces reply variables with empty string when undefined', () => {
     const result = interpolateInstruction(
       '{{replyChannel}} {{replyTarget}} {{replyThread}}',
       { replyChannel: undefined, replyTarget: undefined, replyThread: undefined },
     );
-    assert.equal(result, '{{replyChannel}} {{replyTarget}} {{replyThread}}');
+    assert.equal(result, '  ');
   });
 
   it('replaces all reply variables together', () => {
@@ -136,9 +142,40 @@ describe('isCommandGateway', () => {
   });
 });
 
+describe('resolveCommandTimeoutMs', () => {
+  afterEach(() => {
+    delete process.env.OMX_OPENCLAW_COMMAND_TIMEOUT_MS;
+  });
+
+  it('uses default timeout when gateway and env timeouts are absent', () => {
+    assert.equal(resolveCommandTimeoutMs(undefined, undefined), 5000);
+  });
+
+  it('uses env timeout when gateway timeout is absent', () => {
+    assert.equal(resolveCommandTimeoutMs(undefined, '120000'), 120000);
+  });
+
+  it('uses gateway timeout over env timeout', () => {
+    assert.equal(resolveCommandTimeoutMs(45000, '120000'), 45000);
+  });
+
+  it('clamps timeout to minimum bound', () => {
+    assert.equal(resolveCommandTimeoutMs(10, undefined), 100);
+  });
+
+  it('clamps timeout to maximum bound', () => {
+    assert.equal(resolveCommandTimeoutMs(999999, undefined), 300000);
+  });
+
+  it('ignores invalid env timeout and falls back to default', () => {
+    assert.equal(resolveCommandTimeoutMs(undefined, 'not-a-number'), 5000);
+  });
+});
+
 describe('wakeCommandGateway - command gate', () => {
   afterEach(() => {
     delete process.env.OMX_OPENCLAW_COMMAND;
+    delete process.env.OMX_OPENCLAW_COMMAND_TIMEOUT_MS;
   });
 
   it('returns error when OMX_OPENCLAW_COMMAND is not set', async () => {
@@ -161,5 +198,30 @@ describe('wakeCommandGateway - command gate', () => {
     process.env.OMX_OPENCLAW_COMMAND = '1';
     const result = await wakeCommandGateway('test', { type: 'command', command: 'false' }, {});
     assert.equal(result.success, false);
+  });
+
+  it('uses env timeout when gateway timeout is not set', async () => {
+    const { wakeCommandGateway } = await import('../dispatcher.js');
+    process.env.OMX_OPENCLAW_COMMAND = '1';
+    process.env.OMX_OPENCLAW_COMMAND_TIMEOUT_MS = '100';
+    const result = await wakeCommandGateway(
+      'test',
+      { type: 'command', command: "node -e \"setTimeout(() => {}, 250)\"" },
+      {},
+    );
+    assert.equal(result.success, false);
+    assert.ok(result.error?.includes('SIGTERM'));
+  });
+
+  it('uses gateway timeout over env timeout', async () => {
+    const { wakeCommandGateway } = await import('../dispatcher.js');
+    process.env.OMX_OPENCLAW_COMMAND = '1';
+    process.env.OMX_OPENCLAW_COMMAND_TIMEOUT_MS = '100';
+    const result = await wakeCommandGateway(
+      'test',
+      { type: 'command', command: "node -e \"setTimeout(() => {}, 250)\"", timeout: 500 },
+      {},
+    );
+    assert.equal(result.success, true);
   });
 });

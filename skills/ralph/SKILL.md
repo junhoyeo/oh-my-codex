@@ -35,28 +35,51 @@ Complex tasks often fail silently: partial implementations get declared "done", 
 - Always pass the `model` parameter explicitly when delegating to agents
 - Read `docs/shared/agent-tiers.md` before first delegation to select correct agent tiers
 - Deliver the full implementation: no scope reduction, no partial completion, no deleting tests to make them pass
+- Default to concise, evidence-dense progress and completion reporting unless the user or risk level requires more detail
+- Treat newer user task updates as local overrides for the active workflow branch while preserving earlier non-conflicting constraints
+- If correctness depends on additional inspection, retrieval, execution, or verification, keep using the relevant tools until the execution loop is grounded
+- Continue through clear, low-risk, reversible next steps automatically; ask only when the next step is materially branching, destructive, or preference-dependent
 </Execution_Policy>
 
 <Steps>
+0. **Pre-context intake (required before planning/execution loop starts)**:
+   - Assemble or load a context snapshot at `.omx/context/{task-slug}-{timestamp}.md` (UTC `YYYYMMDDTHHMMSSZ`).
+   - Minimum snapshot fields:
+     - task statement
+     - desired outcome
+     - known facts/evidence
+     - constraints
+     - unknowns/open questions
+     - likely codebase touchpoints
+   - If an existing relevant snapshot is available, reuse it and record the path in Ralph state.
+   - If request ambiguity is high, gather brownfield facts first. When session guidance enables `USE_OMX_EXPLORE_CMD`, prefer `omx explore` for simple read-only repository lookups with narrow, concrete prompts; otherwise use the richer normal explore path. Then run `$deep-interview --quick <task>` to close critical gaps.
+   - Do not begin Ralph execution work (delegation, implementation, or verification loops) until snapshot grounding exists. If forced to proceed quickly, note explicit risk tradeoffs.
 1. **Review progress**: Check TODO list and any prior iteration state
 2. **Continue from where you left off**: Pick up incomplete tasks
 3. **Delegate in parallel**: Route tasks to specialist agents at appropriate tiers
-   - Simple lookups: LOW tier (Haiku) -- "What does this function return?"
-   - Standard work: MEDIUM tier (Sonnet) -- "Add error handling to this module"
-   - Complex analysis: HIGH tier (Opus) -- "Debug this race condition"
+   - Simple lookups: LOW tier -- "What does this function return?"
+   - Standard work: STANDARD tier -- "Add error handling to this module"
+   - Complex analysis: THOROUGH tier -- "Debug this race condition"
+   - When Ralph is entered as a ralplan follow-up, start from the approved **available-agent-types roster** and make the delegation plan explicit: implementation lane, evidence/regression lane, and final sign-off lane using only known agent types
 4. **Run long operations in background**: Builds, installs, test suites use `run_in_background: true`
-5. **Verify completion with fresh evidence**:
+5. **Visual task gate (when screenshot/reference images are present)**:
+   - Run `$visual-verdict` **before every next edit**.
+   - Require structured JSON output: `score`, `verdict`, `category_match`, `differences[]`, `suggestions[]`, `reasoning`.
+   - Persist verdict to `.omx/state/{scope}/ralph-progress.json` including numeric + qualitative feedback.
+   - Default pass threshold: `score >= 90`.
+   - **URL-based cloning tasks**: When the task description contains a target URL (e.g., "clone https://example.com"), invoke `$web-clone` instead of `$visual-verdict`. The web-clone skill handles the full extraction → generation → verification pipeline and uses `$visual-verdict` internally for visual scoring.
+6. **Verify completion with fresh evidence**:
    a. Identify what command proves the task is complete
    b. Run verification (test, build, lint)
    c. Read the output -- confirm it actually passed
    d. Check: zero pending/in_progress TODO items
-6. **Architect verification** (tiered):
-   - <5 files, <100 lines with full tests: STANDARD tier minimum (architect-medium / Sonnet)
-   - Standard changes: STANDARD tier (architect-medium / Sonnet)
-   - >20 files or security/architectural changes: THOROUGH tier (architect / Opus)
+7. **Architect verification** (tiered):
+   - <5 files, <100 lines with full tests: STANDARD tier minimum (architect role)
+   - Standard changes: STANDARD tier (architect role)
+   - >20 files or security/architectural changes: THOROUGH tier (architect role)
    - Ralph floor: always at least STANDARD, even for small changes
-7. **On approval**: Run `/cancel` to cleanly exit and clean up all state files
-8. **On rejection**: Fix the issues raised, then re-verify at the same tier
+8. **On approval**: Run `/cancel` to cleanly exit and clean up all state files
+9. **On rejection**: Fix the issues raised, then re-verify at the same tier
 </Steps>
 
 <Tool_Usage>
@@ -65,6 +88,7 @@ Complex tasks often fail silently: partial implementations get declared "done", 
 - Skip Codex consultation for simple feature additions, well-tested changes, or time-critical verification
 - If ToolSearch finds no MCP tools or Codex is unavailable, proceed with architect agent verification alone -- never block on external tools
 - Use `state_write` / `state_read` for ralph mode state persistence between iterations
+- Persist context snapshot path in Ralph mode state so later phases and agents share the same grounding context
 </Tool_Usage>
 
 ## State Management
@@ -72,7 +96,7 @@ Complex tasks often fail silently: partial implementations get declared "done", 
 Use the `omx_state` MCP server tools (`state_write`, `state_read`, `state_clear`) for Ralph lifecycle state.
 
 - **On start**:
-  `state_write({mode: "ralph", active: true, iteration: 1, max_iterations: 10, current_phase: "executing", started_at: "<now>"})`
+  `state_write({mode: "ralph", active: true, iteration: 1, max_iterations: 10, current_phase: "executing", started_at: "<now>", state: {context_snapshot_path: "<snapshot-path>"}})`
 - **On each iteration**:
   `state_write({mode: "ralph", iteration: <current>, current_phase: "executing"})`
 - **On verification/fix transition**:
@@ -82,13 +106,22 @@ Use the `omx_state` MCP server tools (`state_write`, `state_read`, `state_clear`
 - **On cancellation/cleanup**:
   run `$cancel` (which should call `state_clear(mode="ralph")`)
 
+
+## Scenario Examples
+
+**Good:** The user says `continue` after the workflow already has a clear next step. Continue the current branch of work instead of restarting or re-asking the same question.
+
+**Good:** The user changes only the output shape or downstream delivery step (for example `make a PR`). Preserve earlier non-conflicting workflow constraints and apply the update locally.
+
+**Bad:** The user says `continue`, and the workflow restarts discovery or stops before the missing verification/evidence is gathered.
+
 <Examples>
 <Good>
 Correct parallel delegation:
 ```
-spawn_sub_agent(subagent_type="oh-my-codex:executor-low", model="haiku", prompt="Add type export for UserConfig")
-spawn_sub_agent(subagent_type="oh-my-codex:executor", model="sonnet", prompt="Implement the caching layer for API responses")
-spawn_sub_agent(subagent_type="oh-my-codex:executor-high", model="opus", prompt="Refactor auth module to support OAuth2 flow")
+delegate(role="executor", tier="LOW", task="Add type export for UserConfig")
+delegate(role="executor", tier="STANDARD", task="Implement the caching layer for API responses")
+delegate(role="executor", tier="THOROUGH", task="Refactor auth module to support OAuth2 flow")
 ```
 Why good: Three independent tasks fired simultaneously at appropriate tiers.
 </Good>
@@ -99,7 +132,7 @@ Correct verification before completion:
 1. Run: npm test           → Output: "42 passed, 0 failed"
 2. Run: npm run build      → Output: "Build succeeded"
 3. Run: lsp_diagnostics    → Output: 0 errors
-4. Spawn architect-medium  → Verdict: "APPROVED"
+4. Delegate to architect at STANDARD tier  → Verdict: "APPROVED"
 5. Run /cancel
 ```
 Why good: Fresh evidence at each step, architect verification, then clean exit.
@@ -114,9 +147,9 @@ Why bad: Uses "should" and "look good" -- no fresh test/build output, no archite
 <Bad>
 Sequential execution of independent tasks:
 ```
-spawn_sub_agent(executor-low, "Add type export") → wait →
-spawn_sub_agent(executor, "Implement caching") → wait →
-spawn_sub_agent(executor-high, "Refactor auth")
+delegate(executor, LOW, "Add type export") → wait →
+delegate(executor, STANDARD, "Implement caching") → wait →
+delegate(executor, THOROUGH, "Refactor auth")
 ```
 Why bad: These are independent tasks that should run in parallel, not sequentially.
 </Bad>
@@ -148,12 +181,24 @@ When the user provides the `--prd` flag, initialize a Product Requirements Docum
 ### Detecting PRD Mode
 Check if `{{PROMPT}}` contains `--prd` or `--PRD`.
 
+### Visual Reference Flags (Optional)
+Ralph execution supports visual reference flags for screenshot tasks:
+- Repeatable image inputs: `-i <image-path>` (can be used multiple times)
+- Image directory input: `--images-dir <directory>`
+
+Example:
+`ralph -i refs/hn.png -i refs/hn-item.png --images-dir ./screenshots "match HackerNews layout"`
+
 ### PRD Workflow
-1. Create canonical PRD/progress artifacts:
+1. Run deep-interview in quick mode before creating PRD artifacts:
+   - Execute: `$deep-interview --quick <task>`
+   - Complete a compact requirements pass (context, goals, scope, constraints, validation)
+   - Persist interview output to `.omx/interviews/{slug}-{timestamp}.md`
+2. Create canonical PRD/progress artifacts:
    - PRD: `.omx/plans/prd-{slug}.md`
    - Progress ledger: `.omx/state/{scope}/ralph-progress.json` (session scope when available, else root scope)
-2. Parse the task (everything after `--prd` flag)
-3. Break down into user stories:
+3. Parse the task (everything after `--prd` flag)
+4. Break down into user stories:
 
 ```json
 {
@@ -173,9 +218,9 @@ Check if `{{PROMPT}}` contains `--prd` or `--PRD`.
 }
 ```
 
-4. Initialize canonical progress ledger at `.omx/state/{scope}/ralph-progress.json`
-5. Guidelines: right-sized stories (one session each), verifiable criteria, independent stories, priority order (foundational work first)
-6. Proceed to normal ralph loop using user stories as the task list
+5. Initialize canonical progress ledger at `.omx/state/{scope}/ralph-progress.json`
+6. Guidelines: right-sized stories (one session each), verifiable criteria, independent stories, priority order (foundational work first)
+7. Proceed to normal ralph loop using user stories as the task list
 
 ### Example
 User input: `--prd build a todo app with React and TypeScript`

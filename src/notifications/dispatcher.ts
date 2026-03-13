@@ -514,12 +514,15 @@ export async function dispatchNotifications(
       }),
     ]);
 
+    if (timer) clearTimeout(timer);
+
     return {
       event,
       results,
       anySuccess: results.some((r) => r.success),
     };
   } catch (error) {
+    if (timer) clearTimeout(timer);
     return {
       event,
       results: [
@@ -531,7 +534,5 @@ export async function dispatchNotifications(
       ],
       anySuccess: false,
     };
-  } finally {
-    if (timer) clearTimeout(timer);
   }
 }

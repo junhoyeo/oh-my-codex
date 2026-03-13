@@ -1,4 +1,4 @@
-import { afterEach, describe, it, mock } from 'node:test';
+import { describe, it, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -8,17 +8,60 @@ import {
   detectPrimaryKeyword,
   recordSkillActivation,
   SKILL_ACTIVE_STATE_FILE,
+  DEEP_INTERVIEW_BLOCKED_APPROVAL_INPUTS,
+  DEEP_INTERVIEW_INPUT_LOCK_MESSAGE,
 } from '../keyword-detector.js';
-import { generateKeywordDetectionSection } from '../emulator.js';
 import { isUnderspecifiedForExecution, applyRalplanGate } from '../keyword-detector.js';
 import { KEYWORD_TRIGGER_DEFINITIONS } from '../keyword-registry.js';
 
-async function readTemplateKeywords(): Promise<string[]> {
-  const section = generateKeywordDetectionSection();
-  return [...section.matchAll(/- When user says "([^"]+)":/g)].map((m: RegExpMatchArray) => m[1]);
-}
-
 describe('keyword detector swarm/team compatibility', () => {
+  it('keeps explicit $skill order in detectKeywords results (left-to-right)', () => {
+    const matches = detectKeywords('$analyze $ultraqa $code-review now');
+    assert.deepEqual(matches.map((m) => m.skill).slice(0, 3), ['analyze', 'ultraqa', 'code-review']);
+  });
+
+  it('de-duplicates repeated explicit skill tokens', () => {
+    const matches = detectKeywords('$analyze $analyze root cause');
+    assert.deepEqual(matches.map((m) => m.skill), ['analyze']);
+  });
+
+  it('does not auto-detect keywords for explicit /prompts invocation without $skills', () => {
+    const matches = detectKeywords('/prompts:architect analyze this issue');
+    assert.deepEqual(matches, []);
+    const primary = detectPrimaryKeyword('/prompts:architect analyze this issue');
+    assert.equal(primary, null);
+  });
+
+  it('treats /prompts invocation with trailing punctuation as explicit command', () => {
+    const matches = detectKeywords('/prompts:architect, analyze this issue');
+    assert.deepEqual(matches, []);
+    const primary = detectPrimaryKeyword('/prompts:architect, analyze this issue');
+    assert.equal(primary, null);
+  });
+
+  it('maps analyze keyword to analyze skill', () => {
+    const match = detectPrimaryKeyword('please analyze this workflow');
+    assert.ok(match);
+    assert.equal(match.skill, 'analyze');
+  });
+
+  it('maps code-review keyword variants to code-review skill', () => {
+    const hyphen = detectPrimaryKeyword('run code-review before merge');
+    assert.ok(hyphen);
+    assert.equal(hyphen.skill, 'code-review');
+
+    const spaced = detectPrimaryKeyword('please do a code review');
+    assert.ok(spaced);
+    assert.equal(spaced.skill, 'code-review');
+  });
+
+  it('supports explicit multi-skill invocation by prioritizing left-most $skill', () => {
+    const match = detectPrimaryKeyword('$ultraqa $analyze $code-review run now');
+    assert.ok(match);
+    assert.equal(match.skill, 'ultraqa');
+    assert.equal(match.keyword.toLowerCase(), '$ultraqa');
+  });
+
   it('maps "coordinated team" phrase to team orchestration skill', () => {
     const match = detectPrimaryKeyword('run a coordinated team for implementation');
 
@@ -52,7 +95,7 @@ describe('keyword detector swarm/team compatibility', () => {
   });
 
   it('does not trigger team keyword from filesystem/team-state path text', () => {
-    const match = detectPrimaryKeyword('You have 1 new message(s). Check .omx/state/team/execute-plan/mailbox/worker-3.json');
+    const match = detectPrimaryKeyword('You have 1 new message(s). Read .omx/state/team/execute-plan/mailbox/worker-3.json, act now, reply with concrete progress, then continue assigned work or next feasible task.');
     assert.equal(match, null);
   });
 
@@ -67,10 +110,9 @@ describe('keyword detector swarm/team compatibility', () => {
     assert.equal(match.skill, 'team');
   });
 
-  it('still triggers swarm for explicit /prompts:swarm invocation', () => {
+  it('does not trigger keyword detector for explicit /prompts:swarm invocation', () => {
     const match = detectPrimaryKeyword('use /prompts:swarm for this');
-    assert.ok(match);
-    assert.equal(match.skill, 'team');
+    assert.equal(match, null);
   });
 
   it('prefers ralplan over ralph when both keywords are present', () => {
@@ -87,30 +129,70 @@ describe('keyword detector swarm/team compatibility', () => {
     assert.equal(match.skill, 'team');
     assert.equal(match.keyword.toLowerCase(), 'coordinated swarm');
   });
+
+  it('maps "deep interview" phrase to deep-interview skill', () => {
+    const match = detectPrimaryKeyword('please run a deep interview before planning');
+
+    assert.ok(match);
+    assert.equal(match.skill, 'deep-interview');
+    assert.equal(match.keyword.toLowerCase(), 'deep interview');
+  });
+
+  it('maps "gather requirements" to deep-interview skill', () => {
+    const match = detectPrimaryKeyword('let us gather requirements first');
+
+    assert.ok(match);
+    assert.equal(match.skill, 'deep-interview');
+    assert.equal(match.keyword.toLowerCase(), 'gather requirements');
+  });
+
+  it('maps "ouroboros" to deep-interview skill', () => {
+    const match = detectPrimaryKeyword('please run ouroboros before planning');
+
+    assert.ok(match);
+    assert.equal(match.skill, 'deep-interview');
+    assert.equal(match.keyword.toLowerCase(), 'ouroboros');
+  });
+
+  it('maps "interview me" to deep-interview skill', () => {
+    const match = detectPrimaryKeyword('interview me before we start implementation');
+
+    assert.ok(match);
+    assert.equal(match.skill, 'deep-interview');
+    assert.equal(match.keyword.toLowerCase(), 'interview me');
+  });
+
+  it('maps "don\'t assume" to deep-interview skill', () => {
+    const match = detectPrimaryKeyword("don't assume anything yet");
+
+    assert.ok(match);
+    assert.equal(match.skill, 'deep-interview');
+    assert.equal(match.keyword.toLowerCase(), "don't assume");
+  });
+
+  it('prefers "deep interview" over "interview" for deterministic longest-match behavior', () => {
+    const match = detectPrimaryKeyword('deep interview this request first');
+
+    assert.ok(match);
+    assert.equal(match.skill, 'deep-interview');
+    assert.equal(match.keyword.toLowerCase(), 'deep interview');
+  });
 });
 
-describe('keyword detection guidance generation', () => {
-  it('keeps template keyword table and runtime keyword registry in sync', async () => {
-    const templateKeywords = new Set((await readTemplateKeywords()).map((v: string) => v.toLowerCase()));
+describe('keyword registry coverage', () => {
+  it('includes key team/swarm aliases in runtime keyword registry', () => {
     const registryKeywords = new Set(KEYWORD_TRIGGER_DEFINITIONS.map((v) => v.keyword.toLowerCase()));
-    assert.deepEqual([...registryKeywords].sort(), [...templateKeywords].sort());
-  });
-
-  it('includes swarm alias activation guidance', () => {
-    const section = generateKeywordDetectionSection();
-
-    assert.match(section, /When user says "coordinated team": Activate coordinated team mode/);
-    assert.match(section, /When user says "swarm": Activate coordinated team mode \(swarm is a compatibility alias for team\)/);
-    assert.match(section, /When user says "coordinated swarm": Activate coordinated team mode \(swarm is a compatibility alias for team\)/);
-  });
-
-  it('includes ralplan-first planning gate guidance', () => {
-    const section = generateKeywordDetectionSection();
-
-    assert.match(section, /Ralplan-first execution gate:/);
-    assert.match(section, /`prd-\*\.md`/);
-    assert.match(section, /`test-spec-\*\.md`/);
-    assert.match(section, /if ralph is active/i);
+    assert.ok(registryKeywords.has('ultraqa'));
+    assert.ok(registryKeywords.has('analyze'));
+    assert.ok(registryKeywords.has('investigate'));
+    assert.ok(registryKeywords.has('code review'));
+    assert.ok(registryKeywords.has('code-review'));
+    assert.ok(registryKeywords.has('coordinated team'));
+    assert.ok(registryKeywords.has('swarm'));
+    assert.ok(registryKeywords.has('coordinated swarm'));
+    assert.ok(registryKeywords.has('ouroboros'));
+    assert.ok(registryKeywords.has("don't assume"));
+    assert.ok(registryKeywords.has('interview me'));
   });
 });
 
@@ -142,6 +224,56 @@ describe('keyword detector skill-active-state lifecycle', () => {
       assert.equal(persisted.skill, 'autopilot');
       assert.equal(persisted.phase, 'planning');
       assert.equal(persisted.active, true);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('acquires a deep-interview input lock immediately on activation', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-keyword-state-deep-interview-'));
+    const stateDir = join(cwd, '.omx', 'state');
+    try {
+      await mkdir(stateDir, { recursive: true });
+      const result = await recordSkillActivation({
+        stateDir,
+        text: 'please run a deep interview before planning',
+        nowIso: '2026-02-25T00:00:00.000Z',
+      });
+
+      assert.ok(result);
+      assert.equal(result.skill, 'deep-interview');
+      assert.equal(result.input_lock?.active, true);
+      assert.deepEqual(result.input_lock?.blocked_inputs, [...DEEP_INTERVIEW_BLOCKED_APPROVAL_INPUTS]);
+      assert.equal(result.input_lock?.blocked_inputs.includes('next i should'), true);
+      assert.equal(result.input_lock?.message, DEEP_INTERVIEW_INPUT_LOCK_MESSAGE);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('releases the deep-interview input lock on abort via cancel keyword', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-keyword-state-deep-interview-abort-'));
+    const stateDir = join(cwd, '.omx', 'state');
+    try {
+      await mkdir(stateDir, { recursive: true });
+      await recordSkillActivation({
+        stateDir,
+        text: 'please run deep interview',
+        nowIso: '2026-02-25T00:00:00.000Z',
+      });
+
+      const result = await recordSkillActivation({
+        stateDir,
+        text: 'abort now',
+        nowIso: '2026-02-25T00:05:00.000Z',
+      });
+
+      assert.ok(result);
+      assert.equal(result.skill, 'deep-interview');
+      assert.equal(result.active, false);
+      assert.equal(result.phase, 'completing');
+      assert.equal(result.input_lock?.active, false);
+      assert.equal(result.input_lock?.released_at, '2026-02-25T00:05:00.000Z');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -282,7 +414,9 @@ describe('keyword detector skill-active-state lifecycle', () => {
       await rm(cwd, { recursive: true, force: true });
     }
   });
+
 });
+
 
 describe('isUnderspecifiedForExecution', () => {
   it('flags vague prompt with no files or functions', () => {

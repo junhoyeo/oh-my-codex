@@ -17,9 +17,16 @@
 import { readFile, writeFile, mkdir, rm, readdir } from 'fs/promises';
 import { dirname, join } from 'path';
 import { existsSync } from 'fs';
-import { omxNotepadPath, omxProjectMemoryPath } from '../utils/paths.js';
-import { getStateDir, listModeStateFilesWithScopePreference } from '../mcp/state-paths.js';
+import {
+  codexHome,
+  omxNotepadPath,
+  omxProjectMemoryPath,
+  packageRoot,
+} from '../utils/paths.js';
+import { getReadScopedStateDirs, getStateDir, listModeStateFilesWithScopePreference } from '../mcp/state-paths.js';
 import { generateCodebaseMap } from './codebase-map.js';
+import { SKILL_ACTIVE_STATE_FILE } from './keyword-detector.js';
+import { buildExploreRoutingGuidance } from './explore-routing.js';
 
 const START_MARKER = '<!-- OMX:RUNTIME:START -->';
 const END_MARKER = '<!-- OMX:RUNTIME:END -->';
@@ -57,7 +64,9 @@ async function acquireLock(cwd: string, timeoutMs: number = 5000): Promise<void>
           await rm(lock, { recursive: true, force: true }).catch(() => {});
           continue; // Retry acquire immediately
         }
-      } catch { /* no owner file or parse error, wait */ }
+      } catch (err) {
+        process.stderr.write(`[agents-overlay] lock owner check failed: ${err}\n`);
+      }
       await new Promise(r => setTimeout(r, 100));
     }
   }
@@ -66,7 +75,11 @@ async function acquireLock(cwd: string, timeoutMs: number = 5000): Promise<void>
 }
 
 async function releaseLock(cwd: string): Promise<void> {
-  try { await rm(lockPath(cwd), { recursive: true, force: true }); } catch { /* ignore */ }
+  try {
+    await rm(lockPath(cwd), { recursive: true, force: true });
+  } catch (err) {
+    process.stderr.write(`[agents-overlay] release lock failed: ${err}\n`);
+  }
 }
 
 async function withAgentsMdLock<T>(cwd: string, fn: () => Promise<T>): Promise<T> {
@@ -91,6 +104,12 @@ type OverlaySection = {
   optional: boolean;
 };
 
+export type SessionOrchestrationMode = 'default' | 'team';
+
+export interface GenerateOverlayOptions {
+  orchestrationMode?: SessionOrchestrationMode;
+}
+
 function joinSections(sections: OverlaySection[]): string {
   return sections.map(s => s.text).join('\n\n');
 }
@@ -99,15 +118,19 @@ function capBodyToMax(sections: OverlaySection[], maxBody: number): string {
   // Deterministic overflow policy (lowest priority removed first):
   // 1) Drop optional sections from the end until it fits.
   // 2) If still too large, hard-truncate the final section with ellipsis.
-  let current = sections.slice();
-  let body = joinSections(current);
+  let body = joinSections(sections);
+  if (body.length <= maxBody) return body;
 
-  while (body.length > maxBody) {
-    const lastOptionalIdx = [...current].reverse().findIndex(s => s.optional);
-    if (lastOptionalIdx < 0) break;
-    const idx = current.length - 1 - lastOptionalIdx;
+  const optionalIndices: number[] = [];
+  for (let i = sections.length - 1; i >= 0; i--) {
+    if (sections[i].optional) optionalIndices.push(i);
+  }
+
+  const current = sections.slice();
+  for (const idx of optionalIndices) {
     current.splice(idx, 1);
     body = joinSections(current);
+    if (body.length <= maxBody) return body;
   }
 
   if (body.length > maxBody) {
@@ -148,14 +171,7 @@ async function readRalphPlanningArtifacts(cwd: string): Promise<{ hasPrd: boolea
 async function readActiveModes(cwd: string, sessionId?: string): Promise<string> {
   const refs = await listModeStateFilesWithScopePreference(cwd, sessionId);
 
-  // Compatibility fallback: when a session id is provided, keep root reads available
-  // if no session-scoped file exists for a mode.
   const preferredByMode = new Map<string, { mode: string; path: string; scope: 'root' | 'session' }>();
-  if (sessionId) {
-    for (const ref of await listModeStateFilesWithScopePreference(cwd)) {
-      preferredByMode.set(ref.mode, ref);
-    }
-  }
   for (const ref of refs) {
     preferredByMode.set(ref.mode, ref);
   }
@@ -227,18 +243,59 @@ function getCompactionInstructions(): string {
   ].join('\n');
 }
 
+async function readTeamOrchestratorOverlay(): Promise<string> {
+  const overlayPath = join(packageRoot(), 'prompts', 'team-orchestrator.md');
+  try {
+    return (await readFile(overlayPath, 'utf-8')).trim();
+  } catch {
+    return '';
+  }
+}
+
+export async function resolveSessionOrchestrationMode(
+  cwd: string,
+  sessionId?: string,
+  activeSkill?: string,
+): Promise<SessionOrchestrationMode> {
+  if (activeSkill === 'team') return 'team';
+  if (activeSkill) return 'default';
+
+  const scopedStateDirs = await getReadScopedStateDirs(cwd, sessionId);
+  for (const stateDir of scopedStateDirs) {
+    const statePath = join(stateDir, SKILL_ACTIVE_STATE_FILE);
+    if (!existsSync(statePath)) continue;
+
+    try {
+      const state = JSON.parse(await readFile(statePath, 'utf-8')) as { active?: boolean; skill?: string };
+      if (state.active !== true) return 'default';
+      return state.skill === 'team' ? 'team' : 'default';
+    } catch {
+      return 'default';
+    }
+  }
+
+  return 'default';
+}
+
 /**
  * Generate the overlay content to inject into AGENTS.md.
  * Total output is capped at MAX_OVERLAY_SIZE chars.
  */
-export async function generateOverlay(cwd: string, sessionId?: string): Promise<string> {
-  const [activeModes, notepadPriority, projectMemory, codebaseMap, ralphActive, planningArtifacts] = await Promise.all([
+export async function generateOverlay(
+  cwd: string,
+  sessionId?: string,
+  options: GenerateOverlayOptions = {},
+): Promise<string> {
+  const orchestrationMode = options.orchestrationMode ?? 'default';
+  const [activeModes, notepadPriority, projectMemory, codebaseMap, ralphActive, planningArtifacts, teamOverlay, exploreRoutingGuidance] = await Promise.all([
     readActiveModes(cwd, sessionId),
     readNotepadPriority(cwd),
     readProjectMemorySummary(cwd),
     generateCodebaseMap(cwd),
     isRalphActive(cwd, sessionId),
     readRalphPlanningArtifacts(cwd),
+    orchestrationMode === 'team' ? readTeamOrchestratorOverlay() : Promise.resolve(''),
+    Promise.resolve(buildExploreRoutingGuidance()),
   ]);
 
   // Build sections with deterministic overflow behavior.
@@ -280,6 +337,22 @@ export async function generateOverlay(cwd: string, sessionId?: string): Promise<
     sections.push({
       key: 'project_context',
       text: `**Project Context:**\n${truncate(projectMemory, 1000)}`,
+      optional: true,
+    });
+  }
+
+  if (teamOverlay) {
+    sections.push({
+      key: 'team_orchestrator',
+      text: `**Orchestration Mode:** team\n${truncate(teamOverlay, 900)}`,
+      optional: true,
+    });
+  }
+
+  if (exploreRoutingGuidance) {
+    sections.push({
+      key: 'explore_routing',
+      text: truncate(exploreRoutingGuidance, 600),
       optional: true,
     });
   }
@@ -428,8 +501,9 @@ export function sessionModelInstructionsPath(cwd: string, sessionId: string): st
 }
 
 /**
- * Build a session-scoped AGENTS.md that combines project instructions (if any)
- * and the runtime overlay, without mutating <cwd>/AGENTS.md.
+ * Build a session-scoped AGENTS.md that combines user-level CODEX_HOME
+ * instructions, project instructions (if any), and the runtime overlay,
+ * without mutating the source AGENTS.md files.
  */
 export async function writeSessionModelInstructionsFile(
   cwd: string,
@@ -439,15 +513,26 @@ export async function writeSessionModelInstructionsFile(
   const sessionPath = sessionModelInstructionsPath(cwd, sessionId);
   await mkdir(dirname(sessionPath), { recursive: true });
 
-  const projectAgentsPath = join(cwd, 'AGENTS.md');
-  let base = '';
-  if (existsSync(projectAgentsPath)) {
-    base = await readFile(projectAgentsPath, 'utf-8');
-    base = stripOverlayContent(base);
+  const baseParts: string[] = [];
+  const sourcePaths = [
+    join(codexHome(), 'AGENTS.md'),
+    join(cwd, 'AGENTS.md'),
+  ];
+  const seenPaths = new Set<string>();
+
+  for (const sourcePath of sourcePaths) {
+    if (seenPaths.has(sourcePath) || !existsSync(sourcePath)) continue;
+    seenPaths.add(sourcePath);
+
+    let content = await readFile(sourcePath, 'utf-8');
+    content = stripOverlayContent(content).trim();
+    if (!content) continue;
+    baseParts.push(content);
   }
 
+  const base = baseParts.join('\n\n');
   const composed = base.trim().length > 0
-    ? `${base.trimEnd()}\n\n${overlay}\n`
+    ? `${base}\n\n${overlay}\n`
     : `${overlay}\n`;
 
   await writeFile(sessionPath, composed);

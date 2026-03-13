@@ -8,16 +8,39 @@ import {
   applyWorkerOverlay,
   stripWorkerOverlay,
   writeTeamWorkerInstructionsFile,
+  writeWorkerRoleInstructionsFile,
   removeTeamWorkerInstructionsFile,
   generateInitialInbox,
   generateTaskAssignmentInbox,
   generateShutdownInbox,
   generateTriggerMessage,
   generateMailboxTriggerMessage,
+  generateLeaderMailboxTriggerMessage,
 } from '../worker-bootstrap.js';
 import type { TeamTask } from '../state.js';
 
+function setMockCodexHome(codexHomePath: string): () => void {
+  const previous = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = codexHomePath;
+  return () => {
+    if (typeof previous === 'string') process.env.CODEX_HOME = previous;
+    else delete process.env.CODEX_HOME;
+  };
+}
+
 describe('worker bootstrap', () => {
+  it('worker skill lifecycle instructions are claim-safe (issue #448)', async () => {
+    const workerSkill = await readFile(join(process.cwd(), 'skills', 'worker', 'SKILL.md'), 'utf8');
+
+    assert.match(workerSkill, /omx team api claim-task/);
+    assert.match(workerSkill, /omx team api transition-task-status/);
+    assert.match(workerSkill, /omx team api release-task-claim/);
+    assert.match(workerSkill, /\$\{CODEX_HOME:-~\/\.codex\}\/skills\/worker\/SKILL\.md/);
+    assert.doesNotMatch(workerSkill, /Write completion to the task file/i);
+    assert.doesNotMatch(workerSkill, /`?\{"status":"completed","result":"\.\.\."\}`?/);
+    assert.doesNotMatch(workerSkill, /`?\{"status":"failed","error":"\.\.\."\}`?/);
+  });
+
   it('generateWorkerOverlay produces markdown with correct start/end markers', () => {
     const overlay = generateWorkerOverlay('alpha-team');
 
@@ -28,10 +51,16 @@ describe('worker bootstrap', () => {
   it('generateWorkerOverlay includes the team name', () => {
     const overlay = generateWorkerOverlay('my-team');
     assert.match(overlay, /team "my-team"/);
+    assert.match(overlay, /\$\{CODEX_HOME:-~\/\.codex\}\/skills\/worker\/SKILL\.md/);
+    assert.match(overlay, /~\/\.agents\/skills\/worker\/SKILL\.md/);
     assert.match(overlay, /Resolve canonical team state root/i);
     assert.match(overlay, /<team_state_root>\/team\/my-team\/tasks/);
     assert.match(overlay, /tasks\/task-<id>\.json/);
     assert.match(overlay, /task_id: "<id>"/);
+    assert.match(overlay, /omx team api claim-task/);
+    assert.match(overlay, /omx team api transition-task-status/);
+    assert.match(overlay, /omx team api release-task-claim/);
+    assert.doesNotMatch(overlay, /On completion: write \{"status": "completed"/);
     assert.match(overlay, /Do NOT spawn sub-agents/);
     assert.match(overlay, /do not pass workingDirectory unless the lead explicitly tells you to/);
     assert.doesNotMatch(overlay, /tasks\/\{id\}\.json/);
@@ -183,6 +212,16 @@ describe('worker bootstrap', () => {
     assert.match(inbox, /\*\*Task 2\*\*: Second task/);
     assert.match(inbox, /Resolve canonical team state root/);
     assert.match(inbox, /<team_state_root>\/team\/team-inbox\/tasks\/task-<id>\.json/);
+    assert.match(inbox, /omx team api claim-task/);
+    assert.match(inbox, /omx team api transition-task-status/);
+    assert.match(inbox, /omx team api release-task-claim/);
+    assert.match(inbox, /\$\{CODEX_HOME:-~\/\.codex\}\/skills\/worker\/SKILL\.md/);
+    assert.match(inbox, /~\/\.agents\/skills\/worker\/SKILL\.md/);
+    assert.match(inbox, /ACK: worker-1 initialized/);
+    assert.match(inbox, /Mailbox Delivery Protocol \(Required\)/);
+    assert.match(inbox, /mailbox-mark-delivered/);
+    assert.match(inbox, /continue executing your assigned work or the next feasible task/i);
+    assert.doesNotMatch(inbox, /Write `\{"status": "completed", "result": "brief summary"\}` to the task file/);
     assert.match(inbox, /Verification Requirements/);
     assert.match(inbox, /Fix-Verify Loop/);
   });
@@ -252,6 +291,10 @@ describe('worker bootstrap', () => {
     assert.match(inbox, /Implement parser update/);
     assert.match(inbox, /team_state_root/);
     assert.match(inbox, /team\/team-followup\/tasks\/task-42\.json/);
+    assert.match(inbox, /omx team api claim-task/);
+    assert.match(inbox, /omx team api transition-task-status/);
+    assert.match(inbox, /omx team api release-task-claim/);
+    assert.doesNotMatch(inbox, /Write `\{"status": "completed", "result": "brief summary"\}` when done/);
     assert.match(inbox, /Verification Requirements/);
     assert.match(inbox, /PASS\/FAIL/);
   });
@@ -278,6 +321,20 @@ describe('worker bootstrap', () => {
   it('generateTriggerMessage contains the inbox path', () => {
     const message = generateTriggerMessage('worker-9', 'team-path');
     assert.match(message, /\.omx\/state\/team\/team-path\/workers\/worker-9\/inbox\.md/);
+    assert.match(message, /start work now/i);
+    assert.match(message, /concrete progress/i);
+    assert.match(message, /continue assigned work/i);
+    assert.match(message, /next feasible task/i);
+  });
+
+  it('generateTriggerMessage uses provided state-root reference for worktree workers', () => {
+    const message = generateTriggerMessage('worker-9', 'team-path', '$OMX_TEAM_STATE_ROOT');
+    assert.match(message, /\$OMX_TEAM_STATE_ROOT\/team\/team-path\/workers\/worker-9\/inbox\.md/);
+    assert.match(message, /work now/i);
+    assert.match(message, /report progress/i);
+    assert.match(message, /continue assigned work/i);
+    assert.match(message, /next feasible task/i);
+    assert.ok(message.length < 200);
   });
 
   it('generateMailboxTriggerMessage is always < 200 characters', () => {
@@ -288,19 +345,62 @@ describe('worker bootstrap', () => {
   it('generateMailboxTriggerMessage contains mailbox path and count', () => {
     const message = generateMailboxTriggerMessage('worker-2', 'team-mail', 3);
     assert.match(message, /3 new message/);
-    assert.match(message, /\.omx\/state\/team\/team-mail\/mailbox\/worker-2\.json/);
+    assert.match(message, /Read .*\.omx\/state\/team\/team-mail\/mailbox\/worker-2\.json/);
+    assert.match(message, /act now/i);
+    assert.match(message, /concrete progress/i);
+    assert.match(message, /continue assigned work/i);
+    assert.match(message, /next feasible task/i);
   });
 
-  it('writeTeamWorkerInstructionsFile composes base AGENTS.md with overlay', async () => {
+  it('generateMailboxTriggerMessage uses provided state-root reference for worktree workers', () => {
+    const message = generateMailboxTriggerMessage('worker-2', 'team-mail', 3, '$OMX_TEAM_STATE_ROOT');
+    assert.match(message, /3 new msg/);
+    assert.match(message, /read .*\$OMX_TEAM_STATE_ROOT\/team\/team-mail\/mailbox\/worker-2\.json/i);
+    assert.match(message, /act/i);
+    assert.match(message, /report progress/i);
+    assert.match(message, /continue assigned work/i);
+    assert.match(message, /next feasible task/i);
+    assert.ok(message.length < 200);
+  });
+
+  it('generateLeaderMailboxTriggerMessage is always < 200 characters', () => {
+    const message = generateLeaderMailboxTriggerMessage('team-with-long-name', 'worker-long-name');
+    assert.ok(message.length < 200);
+  });
+
+  it('generateLeaderMailboxTriggerMessage tells the leader to read the mailbox and reply', () => {
+    const message = generateLeaderMailboxTriggerMessage('team-mail', 'worker-2');
+    assert.match(message, /Read .*\.omx\/state\/team\/team-mail\/mailbox\/leader-fixed\.json/);
+    assert.match(message, /worker-2 sent a new message/);
+    assert.match(message, /Reply with the next concrete step/);
+  });
+
+  it('generateLeaderMailboxTriggerMessage uses provided state-root reference for worktree leaders', () => {
+    const message = generateLeaderMailboxTriggerMessage('team-mail', 'worker-2', '$OMX_TEAM_STATE_ROOT');
+    assert.match(message, /read .*\$OMX_TEAM_STATE_ROOT\/team\/team-mail\/mailbox\/leader-fixed\.json/i);
+    assert.match(message, /new msg from worker-2/i);
+    assert.match(message, /reply next step/i);
+    assert.ok(message.length < 200);
+  });
+
+  it('writeTeamWorkerInstructionsFile composes user + project AGENTS.md with overlay', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-worker-bootstrap-'));
+    const restoreCodexHome = setMockCodexHome(join(cwd, 'home', '.codex'));
     try {
+      await mkdir(join(cwd, 'home', '.codex'), { recursive: true });
+      await writeFile(join(cwd, 'home', '.codex', 'AGENTS.md'), '# User Instructions\n\nStart globally.\n', 'utf8');
       await writeFile(join(cwd, 'AGENTS.md'), '# Project Instructions\n\nDo good work.\n', 'utf8');
 
       const overlay = generateWorkerOverlay('compose-team');
       const outPath = await writeTeamWorkerInstructionsFile('compose-team', cwd, overlay);
 
       const content = await readFile(outPath, 'utf8');
+      assert.match(content, /# User Instructions/);
       assert.match(content, /# Project Instructions/);
+      assert.ok(
+        content.indexOf('# User Instructions') <
+        content.indexOf('# Project Instructions'),
+      );
       assert.match(content, /Do good work/);
       assert.match(content, /<!-- OMX:TEAM:WORKER:START -->/);
       assert.match(content, /<!-- OMX:TEAM:WORKER:END -->/);
@@ -308,6 +408,32 @@ describe('worker bootstrap', () => {
       // Verify project AGENTS.md was NOT modified
       const projectContent = await readFile(join(cwd, 'AGENTS.md'), 'utf8');
       assert.doesNotMatch(projectContent, /<!-- OMX:TEAM:WORKER:START -->/);
+    } finally {
+      restoreCodexHome();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+
+  it('writeWorkerRoleInstructionsFile layers role prompt on top of team worker instructions', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-worker-bootstrap-'));
+    try {
+      const overlay = generateWorkerOverlay('role-team');
+      const basePath = await writeTeamWorkerInstructionsFile('role-team', cwd, overlay);
+      const outPath = await writeWorkerRoleInstructionsFile(
+        'role-team',
+        'worker-2',
+        cwd,
+        basePath,
+        'writer',
+        '<identity>Writer role prompt</identity>',
+      );
+
+      const content = await readFile(outPath, 'utf8');
+      assert.match(content, /team "role-team"/);
+      assert.match(content, /<!-- OMX:TEAM:ROLE:START -->/);
+      assert.match(content, /\*\*writer\*\* role/);
+      assert.match(content, /<identity>Writer role prompt<\/identity>/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

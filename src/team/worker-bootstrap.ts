@@ -2,6 +2,8 @@ import type { TeamTask } from './state.js';
 import { mkdir, readFile, rm, stat, writeFile } from 'fs/promises';
 import { dirname, join } from 'path';
 import { getFixLoopInstructions, getVerificationInstructions } from '../verification/verifier.js';
+import { codexHome } from '../utils/paths.js';
+import { sleep } from '../utils/sleep.js';
 
 const TEAM_OVERLAY_START = '<!-- OMX:TEAM:WORKER:START -->';
 const TEAM_OVERLAY_END = '<!-- OMX:TEAM:WORKER:END -->';
@@ -39,8 +41,12 @@ You are a team worker in team "${teamName}". Your identity and assigned tasks ar
 
 ## Protocol
 1. Read your inbox file at the path provided in your first instruction
-2. Load the worker skill instructions from skills/worker/SKILL.md in this repository and follow them
-3. Send an ACK to the lead using MCP tool team_send_message (to_worker="leader-fixed") once initialized
+2. Load the worker skill instructions from the first path that exists:
+   - \`${'${CODEX_HOME:-~/.codex}'}/skills/worker/SKILL.md\`
+   - \`~/.agents/skills/worker/SKILL.md\`
+   - \`<leader_cwd>/.agents/skills/worker/SKILL.md\`
+   - \`<leader_cwd>/skills/worker/SKILL.md\` (repo fallback)
+3. Send an ACK to the lead using CLI interop \`omx team api send-message --json\` (to_worker="leader-fixed") once initialized
 4. Resolve canonical team state root in this order:
    - OMX_TEAM_STATE_ROOT env
    - worker identity team_state_root
@@ -49,28 +55,40 @@ You are a team worker in team "${teamName}". Your identity and assigned tasks ar
 5. Read your task from <team_state_root>/team/${teamName}/tasks/task-<id>.json (example: task-1.json)
 6. Task id format:
    - State/MCP APIs use task_id: "<id>" (example: "1"), never "task-1"
-7. Request a claim via the state API (claimTask); do not directly set status to "in_progress" in the task file
+7. Request a claim via CLI interop (\`omx team api claim-task --json\`); do not directly set lifecycle fields in the task file
 8. Do the work using your tools
-9. On completion: write {"status": "completed", "result": "summary of what was done"} to the task file
-10. Update your status: write {"state": "idle", "updated_at": "<current ISO timestamp>"} to <team_state_root>/team/${teamName}/workers/{your-name}/status.json
-11. Wait for new instructions (the lead will send them via your terminal)
-12. Check your mailbox for messages at <team_state_root>/team/${teamName}/mailbox/{your-name}.json
-13. For team_* MCP tools, do not pass workingDirectory unless the lead explicitly tells you to
+9. On completion/failure, use lifecycle transition APIs:
+   - \`omx team api transition-task-status --json\` with from \`"in_progress"\` to \`"completed"\` or \`"failed"\`
+   - Include \`result\` (for completed) or \`error\` (for failed) in the transition patch
+10. Use \`omx team api release-task-claim --json\` only for rollback/requeue to \`pending\` (not for completion)
+11. Update your status: write {"state": "idle", "updated_at": "<current ISO timestamp>"} to <team_state_root>/team/${teamName}/workers/{your-name}/status.json
+12. Wait for new instructions (the lead will send them via your terminal)
+13. Check your mailbox for messages at <team_state_root>/team/${teamName}/mailbox/{your-name}.json
+14. For legacy team_* MCP tools (hard-deprecated), switch to \`omx team api\` CLI interop; do not pass workingDirectory unless the lead explicitly tells you to
 
 ## Message Protocol
-When calling team_send_message, you MUST always include:
+When calling \`omx team api send-message\`, you MUST always include:
 - from_worker: "<your-worker-name>" (your identity — check your inbox file for your worker name, never omit this)
 - to_worker: "leader-fixed" (to message the leader) or "worker-N" (for peers)
 
+## Startup Handshake (Required)
+Before doing any task work, send exactly one startup ACK to the leader.
+Keep the body short and deterministic so all worker CLIs (Codex/Claude) behave consistently.
+
 Example:
-team_send_message({ team_name: "${teamName}", from_worker: "<your-worker-name>", to_worker: "leader-fixed", body: "Task completed" })
+omx team api send-message --input "{\"team_name\":\"${teamName}\",\"from_worker\":\"<your-worker-name>\",\"to_worker\":\"leader-fixed\",\"body\":\"ACK: <your-worker-name> initialized\"}" --json
 
 CRITICAL: Never omit from_worker. The MCP server cannot auto-detect your identity.
+
+When your mailbox receives a message, process delivery explicitly:
+1. Read: \`omx team api mailbox-list --input "{\"team_name\":\"${teamName}\",\"worker\":\"<your-worker-name>\"}" --json\`
+2. Mark delivered: \`omx team api mailbox-mark-delivered --input "{\"team_name\":\"${teamName}\",\"worker\":\"<your-worker-name>\",\"message_id\":\"<MESSAGE_ID>\"}" --json\`
+3. If you reply, include concrete progress and keep executing your assigned work or the next feasible task after replying.
 
 ## Rules
 - Do NOT edit files outside the paths listed in your task description
 - If you need to modify a shared file, report to the lead by writing to your status file with state "blocked"
-- ALWAYS write results to the task file before reporting done
+- Do NOT write lifecycle fields (\`status\`, \`owner\`, \`result\`, \`error\`) directly in task files; use claim-safe lifecycle APIs
 - If blocked, write {"state": "blocked", "reason": "..."} to your status file
 - Do NOT spawn sub-agents (no spawn_agent). Complete work in this worker session only.
 </team_worker_protocol>
@@ -128,9 +146,9 @@ function stripOverlayFromContent(content: string): string {
 }
 
 /**
- * Write a team-scoped model instructions file that composes the project's
- * AGENTS.md (if any) with the worker overlay. This avoids mutating the
- * project's AGENTS.md directly.
+ * Write a team-scoped model instructions file that composes user-level
+ * CODEX_HOME AGENTS.md, the project's AGENTS.md (if any), and the worker
+ * overlay. This avoids mutating the source AGENTS.md files directly.
  *
  * Returns the absolute path to the composed file.
  */
@@ -139,21 +157,68 @@ export async function writeTeamWorkerInstructionsFile(
   cwd: string,
   overlay: string,
 ): Promise<string> {
-  const projectAgentsPath = join(cwd, 'AGENTS.md');
-  let base = '';
-  try {
-    base = await readFile(projectAgentsPath, 'utf-8');
-    // Strip any stale overlays from the base content
-    base = stripOverlayFromContent(base);
-  } catch {
-    // No project AGENTS.md -- compose with overlay only
+  const baseParts: string[] = [];
+  const sourcePaths = [
+    join(codexHome(), 'AGENTS.md'),
+    join(cwd, 'AGENTS.md'),
+  ];
+  const seenPaths = new Set<string>();
+
+  for (const sourcePath of sourcePaths) {
+    if (seenPaths.has(sourcePath)) continue;
+    seenPaths.add(sourcePath);
+
+    let content = '';
+    try {
+      content = await readFile(sourcePath, 'utf-8');
+    } catch {
+      continue;
+    }
+
+    content = stripOverlayFromContent(content).trim();
+    if (!content) continue;
+    baseParts.push(content);
   }
 
+  const base = baseParts.join('\n\n');
   const composed = base.trim().length > 0
-    ? `${base.trimEnd()}\n\n${overlay}\n`
+    ? `${base}\n\n${overlay}\n`
     : `${overlay}\n`;
 
   const outPath = join(cwd, '.omx', 'state', 'team', teamName, 'worker-agents.md');
+  await mkdir(dirname(outPath), { recursive: true });
+  await writeFile(outPath, composed);
+  return outPath;
+}
+
+/**
+ * Compose a per-worker startup instructions file by layering the team worker
+ * instructions with the resolved role prompt content.
+ */
+export async function writeWorkerRoleInstructionsFile(
+  teamName: string,
+  workerName: string,
+  cwd: string,
+  baseInstructionsPath: string,
+  workerRole: string,
+  rolePromptContent: string,
+): Promise<string> {
+  const base = await readFile(baseInstructionsPath, 'utf-8').catch(() => '');
+  const roleOverlay = `
+<!-- OMX:TEAM:ROLE:START -->
+<team_worker_role>
+You are operating as the **${workerRole}** role for this team run. Apply the following role-local guidance in addition to the team worker protocol.
+
+${rolePromptContent.trim()}
+</team_worker_role>
+<!-- OMX:TEAM:ROLE:END -->
+`;
+  const composed = base.trim().length > 0
+    ? `${base.trimEnd()}
+
+${roleOverlay}`
+    : roleOverlay.trimStart();
+  const outPath = join(cwd, '.omx', 'state', 'team', teamName, 'workers', workerName, 'AGENTS.md');
   await mkdir(dirname(outPath), { recursive: true });
   await writeFile(outPath, composed);
   return outPath;
@@ -235,10 +300,6 @@ async function withAgentsMdLock<T>(agentsMdPath: string, fn: () => Promise<T>): 
   }
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 /**
  * Generate initial inbox file content for worker bootstrap.
  * This is written to .omx/state/team/{team}/workers/{worker}/inbox.md by the lead.
@@ -288,26 +349,45 @@ ${taskList}
 
 ## Instructions
 
-1. Load and follow \`skills/worker/SKILL.md\`
-2. Send startup ACK to the lead mailbox using MCP tool \`team_send_message\` with \`to_worker="leader-fixed"\`
+1. Load and follow the worker skill from the first existing path:
+   - \`${'${CODEX_HOME:-~/.codex}'}/skills/worker/SKILL.md\`
+   - \`~/.agents/skills/worker/SKILL.md\`
+   - \`${leaderCwd}/.agents/skills/worker/SKILL.md\`
+   - \`${leaderCwd}/skills/worker/SKILL.md\` (repo fallback)
+2. Send startup ACK to the lead mailbox BEFORE any task work (run this exact command):
+
+   \`omx team api send-message --input "{\"team_name\":\"${teamName}\",\"from_worker\":\"${workerName}\",\"to_worker\":\"leader-fixed\",\"body\":\"ACK: ${workerName} initialized\"}" --json\`
+
 3. Start with the first non-blocked task
 4. Resolve canonical team state root in this order: \`OMX_TEAM_STATE_ROOT\` env -> worker identity \`team_state_root\` -> config/manifest \`team_state_root\` -> local cwd fallback.
 5. Read the task file for your selected task id at \`${teamStateRoot}/team/${teamName}/tasks/task-<id>.json\` (example: \`task-1.json\`)
 6. Task id format:
    - State/MCP APIs use \`task_id: "<id>"\` (example: \`"1"\`), not \`"task-1"\`.
-7. Request a claim via state API (\`claimTask\`) to claim it
+7. Request a claim via CLI interop (\`omx team api claim-task --json\`) to claim it
 8. Complete the work described in the task
-9. Write \`{"status": "completed", "result": "brief summary"}\` to the task file
-10. Write \`{"state": "idle", "updated_at": "<current ISO timestamp>"}\` to \`${teamStateRoot}/team/${teamName}/workers/${workerName}/status.json\`
-11. Wait for the next instruction from the lead
-12. For team_* MCP tools, do not pass \`workingDirectory\` unless the lead explicitly asks (if resolution fails, use leader cwd: \`${leaderCwd}\`)
+9. Complete/fail it via lifecycle transition API (\`omx team api transition-task-status --json\`) from \`"in_progress"\` to \`"completed"\` or \`"failed"\` (include \`result\`/\`error\`)
+10. Use \`omx team api release-task-claim --json\` only for rollback to \`pending\`
+11. Write \`{"state": "idle", "updated_at": "<current ISO timestamp>"}\` to \`${teamStateRoot}/team/${teamName}/workers/${workerName}/status.json\`
+12. Wait for the next instruction from the lead
+13. For legacy team_* MCP tools (hard-deprecated), use \`omx team api\`; do not pass \`workingDirectory\` unless the lead explicitly asks (if resolution fails, use leader cwd: \`${leaderCwd}\`)
+
+## Mailbox Delivery Protocol (Required)
+When you are notified about mailbox messages, always follow this exact flow:
+
+1. List mailbox:
+   \`omx team api mailbox-list --input "{\"team_name\":\"${teamName}\",\"worker\":\"${workerName}\"}" --json\`
+2. For each undelivered message, mark delivery:
+   \`omx team api mailbox-mark-delivered --input "{\"team_name\":\"${teamName}\",\"worker\":\"${workerName}\",\"message_id\":\"<MESSAGE_ID>\"}" --json\`
+
+Use terse ACK bodies (single line) for consistent parsing across Codex and Claude workers.
+After any mailbox reply, continue executing your assigned work or the next feasible task; do not stop after sending the reply.
 
 ## Message Protocol
-When using team_send_message MCP tool, ALWAYS include from_worker with YOUR worker name:
+When using \`omx team api send-message\`, ALWAYS include from_worker with YOUR worker name:
 - from_worker: "${workerName}"
 - to_worker: "leader-fixed" (for leader) or "worker-N" (for peers)
 
-Example: team_send_message({ team_name: "${teamName}", from_worker: "${workerName}", to_worker: "leader-fixed", body: "ACK: initialized" })
+Example: omx team api send-message --input "{\"team_name\":\"${teamName}\",\"from_worker\":\"${workerName}\",\"to_worker\":\"leader-fixed\",\"body\":\"ACK: initialized\"}" --json
 
 ${buildVerificationSection('each assigned task')}
 
@@ -342,10 +422,11 @@ ${taskDescription}
 1. Resolve canonical team state root and read the task file at \`<team_state_root>/team/${teamName}/tasks/task-${taskId}.json\`
 2. Task id format:
    - State/MCP APIs use \`task_id: "${taskId}"\` (not \`"task-${taskId}"\`).
-3. Request a claim via state API (\`claimTask\`)
+3. Request a claim via CLI interop (\`omx team api claim-task --json\`)
 4. Complete the work
-5. Write \`{"status": "completed", "result": "brief summary"}\` when done
-6. Write \`{"state": "idle", "updated_at": "<current ISO timestamp>"}\` to your status file
+5. Complete/fail via lifecycle transition API (\`omx team api transition-task-status --json\`) from \`"in_progress"\` to \`"completed"\` or \`"failed"\` (include \`result\`/\`error\`)
+6. Use \`omx team api release-task-claim --json\` only for rollback to \`pending\`
+7. Write \`{"state": "idle", "updated_at": "<current ISO timestamp>"}\` to your status file
 
 ${buildVerificationSection(taskDescription)}
 `;
@@ -373,19 +454,52 @@ Type \`exit\` or press Ctrl+C to end your Codex session.
 `;
 }
 
+function buildInstructionPath(...parts: string[]): string {
+  return join(...parts).replaceAll('\\', '/');
+}
+
 /**
  * Generate the SHORT send-keys trigger message.
  * Always < 200 characters, ASCII-safe.
  */
-export function generateTriggerMessage(workerName: string, teamName: string): string {
-  return `Read and follow the instructions in .omx/state/team/${teamName}/workers/${workerName}/inbox.md`;
+export function generateTriggerMessage(
+  workerName: string,
+  teamName: string,
+  teamStateRoot: string = '.omx/state',
+): string {
+  const inboxPath = buildInstructionPath(teamStateRoot, 'team', teamName, 'workers', workerName, 'inbox.md');
+  if (teamStateRoot !== '.omx/state') {
+    return `Read ${inboxPath}, work now, report progress, continue assigned work or next feasible task.`;
+  }
+  return `Read ${inboxPath}, start work now, report concrete progress, then continue assigned work or next feasible task.`;
 }
 
 /**
  * Generate a SHORT trigger for mailbox notifications.
  * Always < 200 characters, ASCII-safe.
  */
-export function generateMailboxTriggerMessage(workerName: string, teamName: string, count: number): string {
+export function generateMailboxTriggerMessage(
+  workerName: string,
+  teamName: string,
+  count: number,
+  teamStateRoot: string = '.omx/state',
+): string {
   const n = Number.isFinite(count) ? Math.max(1, Math.floor(count)) : 1;
-  return `You have ${n} new message(s). Check .omx/state/team/${teamName}/mailbox/${workerName}.json`;
+  const mailboxPath = buildInstructionPath(teamStateRoot, 'team', teamName, 'mailbox', workerName + '.json');
+  if (teamStateRoot !== '.omx/state') {
+    return `${n} new msg(s): read ${mailboxPath}, act, report progress, continue assigned work or next feasible task.`;
+  }
+  return `You have ${n} new message(s). Read ${mailboxPath}, act now, reply with concrete progress, then continue assigned work or next feasible task.`;
+}
+
+export function generateLeaderMailboxTriggerMessage(
+  teamName: string,
+  fromWorker: string,
+  teamStateRoot: string = '.omx/state',
+): string {
+  const mailboxPath = buildInstructionPath(teamStateRoot, 'team', teamName, 'mailbox', 'leader-fixed.json');
+  if (teamStateRoot !== '.omx/state') {
+    return `Read ${mailboxPath}; new msg from ${fromWorker}. Reply next step.`;
+  }
+  return `Read ${mailboxPath}; ${fromWorker} sent a new message. Reply with the next concrete step.`;
 }

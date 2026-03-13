@@ -2,6 +2,16 @@
 
 This file defines practical tier guidance for OMX agent routing.
 
+## Mental Model
+
+OMX now separates three concepts:
+
+- `role`: what the agent is responsible for (`executor`, `planner`, `architect`)
+- `tier`: how much reasoning/cost to spend (`LOW`, `STANDARD`, `THOROUGH`)
+- `posture`: how the role behaves (`frontier-orchestrator`, `deep-worker`, `fast-lane`)
+
+Use role to choose responsibility, tier to choose depth, and posture to choose operating style.
+
 ## Tiers
 
 - `LOW`:
@@ -27,3 +37,20 @@ This file defines practical tier guidance for OMX agent routing.
    - architectural decisions with system-wide impact
    - large refactors across many files
 4. For Ralph completion checks, use at least `STANDARD` architect verification.
+
+## Posture Guidance
+
+- `frontier-orchestrator`:
+  - Best for steerable frontier models and leader-style roles.
+  - Prioritizes intent classification, delegation, verification, and architectural judgment.
+  - Typical roles: `planner`, `analyst`, `architect`, `critic`, `code-reviewer`.
+
+- `deep-worker`:
+  - Best for implementation-heavy roles that should carry work to completion.
+  - Prioritizes direct execution, minimal diffs, and strict verification.
+  - Typical roles: `executor`, `debugger`, `test-engineer`, `build-fixer`.
+
+- `fast-lane`:
+  - Best for cheap/fast models used for triage, search, and narrow synthesis.
+  - Prioritizes quick routing, concise search, and escalation over deep autonomous work.
+  - Typical roles: `explore`, `writer`, and lightweight research/search specialists.

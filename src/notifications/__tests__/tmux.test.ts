@@ -201,7 +201,7 @@ describe('captureTmuxPane', () => {
         'lines=""',
         'while [ "$#" -gt 0 ]; do',
         '  if [ "$1" = "-t" ]; then target="$2"; shift 2; continue; fi',
-        '  if [ "$1" = "-l" ]; then lines="$2"; shift 2; continue; fi',
+        '  if [ "$1" = "-S" ]; then lines="$2"; shift 2; continue; fi',
         '  shift',
         'done',
         'printf "capture:%s:%s\\n" "$target" "$lines"',
@@ -210,9 +210,9 @@ describe('captureTmuxPane', () => {
     chmodSync(tmuxPath, 0o755);
     process.env.PATH = `${fakeBinDir}:${originalPath ?? ''}`;
 
-    assert.equal(captureTmuxPane('%42', 7.8), 'capture:%42:7');
-    assert.equal(captureTmuxPane('%42', Number.NaN), 'capture:%42:12');
-    assert.equal(captureTmuxPane('%42', 0), 'capture:%42:1');
-    assert.equal(captureTmuxPane('%42', 999999), 'capture:%42:2000');
+    assert.equal(captureTmuxPane('%42', 7.8), 'capture:%42:-7');
+    assert.equal(captureTmuxPane('%42', Number.NaN), 'capture:%42:-12');
+    assert.equal(captureTmuxPane('%42', 0), 'capture:%42:-1');
+    assert.equal(captureTmuxPane('%42', 999999), 'capture:%42:-2000');
   });
 });

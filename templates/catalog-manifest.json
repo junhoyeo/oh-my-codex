@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "catalogVersion": "2026.02.20.1",
+  "catalogVersion": "2026.02.28.1",
   "skills": [
     {
       "name": "autopilot",
@@ -33,7 +33,7 @@
     {
       "name": "ecomode",
       "category": "execution",
-      "status": "deprecated",
+      "status": "merged",
       "canonical": "ultrawork",
       "core": false,
       "internalRequired": false
@@ -70,6 +70,13 @@
       "internalRequired": false
     },
     {
+      "name": "deep-interview",
+      "category": "planning",
+      "status": "active",
+      "core": false,
+      "internalRequired": false
+    },
+    {
       "name": "analyze",
       "category": "shortcut",
       "status": "alias",
@@ -102,6 +109,13 @@
       "internalRequired": false
     },
     {
+      "name": "ai-slop-cleaner",
+      "category": "shortcut",
+      "status": "active",
+      "core": false,
+      "internalRequired": false
+    },
+    {
       "name": "code-review",
       "category": "shortcut",
       "status": "active",
@@ -114,6 +128,22 @@
       "category": "shortcut",
       "status": "active",
       "canonical": "security-reviewer",
+      "core": false,
+      "internalRequired": false
+    },
+    {
+      "name": "visual-verdict",
+      "category": "shortcut",
+      "status": "active",
+      "canonical": "vision",
+      "core": false,
+      "internalRequired": false
+    },
+    {
+      "name": "web-clone",
+      "category": "shortcut",
+      "status": "active",
+      "canonical": "vision",
       "core": false,
       "internalRequired": false
     },
@@ -138,6 +168,20 @@
       "category": "shortcut",
       "status": "alias",
       "canonical": "plan --review",
+      "core": false,
+      "internalRequired": false
+    },
+    {
+      "name": "ask-claude",
+      "category": "shortcut",
+      "status": "active",
+      "core": false,
+      "internalRequired": false
+    },
+    {
+      "name": "ask-gemini",
+      "category": "shortcut",
+      "status": "active",
       "core": false,
       "internalRequired": false
     },
@@ -198,10 +242,9 @@
       "internalRequired": false
     },
     {
-      "name": "configure-telegram",
+      "name": "configure-notifications",
       "category": "utility",
-      "status": "merged",
-      "canonical": "omx-setup",
+      "status": "active",
       "core": false,
       "internalRequired": false
     },
@@ -209,7 +252,31 @@
       "name": "configure-discord",
       "category": "utility",
       "status": "merged",
-      "canonical": "omx-setup",
+      "canonical": "configure-notifications",
+      "core": false,
+      "internalRequired": false
+    },
+    {
+      "name": "configure-telegram",
+      "category": "utility",
+      "status": "merged",
+      "canonical": "configure-notifications",
+      "core": false,
+      "internalRequired": false
+    },
+    {
+      "name": "configure-slack",
+      "category": "utility",
+      "status": "merged",
+      "canonical": "configure-notifications",
+      "core": false,
+      "internalRequired": false
+    },
+    {
+      "name": "configure-openclaw",
+      "category": "utility",
+      "status": "merged",
+      "canonical": "configure-notifications",
       "core": false,
       "internalRequired": false
     },
@@ -259,6 +326,11 @@
       "name": "executor",
       "category": "build",
       "status": "active"
+    },
+    {
+      "name": "team-executor",
+      "category": "build",
+      "status": "internal"
     },
     {
       "name": "verifier",

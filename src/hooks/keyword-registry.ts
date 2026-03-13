@@ -18,6 +18,16 @@ export const KEYWORD_TRIGGER_DEFINITIONS: readonly KeywordTriggerDefinition[] = 
   { keyword: 'ultrawork', skill: 'ultrawork', priority: 10, guidance: 'Activate ultrawork parallel execution mode' },
   { keyword: 'ulw', skill: 'ultrawork', priority: 10, guidance: 'Activate ultrawork parallel execution mode' },
   { keyword: 'parallel', skill: 'ultrawork', priority: 10, guidance: 'Activate ultrawork parallel execution mode' },
+  { keyword: 'ultraqa', skill: 'ultraqa', priority: 8, guidance: 'Activate UltraQA cycling workflow' },
+  { keyword: 'analyze', skill: 'analyze', priority: 7, guidance: 'Activate deep analysis workflow' },
+  { keyword: 'investigate', skill: 'analyze', priority: 7, guidance: 'Activate deep analysis workflow' },
+
+  { keyword: 'deep interview', skill: 'deep-interview', priority: 8, guidance: 'Activate Ouroboros-inspired Socratic ambiguity-gated interview workflow' },
+  { keyword: 'gather requirements', skill: 'deep-interview', priority: 8, guidance: 'Activate Ouroboros-inspired Socratic ambiguity-gated interview workflow' },
+  { keyword: 'interview me', skill: 'deep-interview', priority: 8, guidance: 'Activate Ouroboros-inspired Socratic ambiguity-gated interview workflow' },
+  { keyword: "don't assume", skill: 'deep-interview', priority: 8, guidance: 'Activate Ouroboros-inspired Socratic ambiguity-gated interview workflow' },
+  { keyword: 'ouroboros', skill: 'deep-interview', priority: 8, guidance: 'Activate Ouroboros-inspired Socratic ambiguity-gated interview workflow' },
+  { keyword: 'interview', skill: 'deep-interview', priority: 8, guidance: 'Activate Ouroboros-inspired Socratic ambiguity-gated interview workflow' },
 
   { keyword: 'plan this', skill: 'plan', priority: 8, guidance: 'Activate planning skill' },
   { keyword: 'plan the', skill: 'plan', priority: 8, guidance: 'Activate planning skill' },
@@ -41,6 +51,8 @@ export const KEYWORD_TRIGGER_DEFINITIONS: readonly KeywordTriggerDefinition[] = 
   { keyword: 'fix build', skill: 'build-fix', priority: 6, guidance: 'Activate build-fix workflow' },
   { keyword: 'type errors', skill: 'build-fix', priority: 6, guidance: 'Activate build-fix workflow' },
 
+  { keyword: 'code review', skill: 'code-review', priority: 6, guidance: 'Activate code-review workflow' },
+  { keyword: 'code-review', skill: 'code-review', priority: 6, guidance: 'Activate code-review workflow' },
   { keyword: 'review code', skill: 'code-review', priority: 6, guidance: 'Activate code-review workflow' },
   { keyword: 'security review', skill: 'security-review', priority: 6, guidance: 'Activate security-review workflow' },
 ] as const;

@@ -3,19 +3,33 @@
  * Multi-agent orchestration for OpenAI Codex CLI
  */
 
-import { execSync, execFileSync, spawn } from 'child_process';
+import { execFileSync, spawn } from 'child_process';
 import { basename, dirname, join } from 'path';
 import { existsSync, readFileSync } from 'fs';
 import { constants as osConstants } from 'os';
 import { setup, SETUP_SCOPES, type SetupScope } from './setup.js';
 import { uninstall } from './uninstall.js';
-import { doctor } from './doctor.js';
 import { version } from './version.js';
 import { tmuxHookCommand } from './tmux-hook.js';
 import { hooksCommand } from './hooks.js';
 import { hudCommand } from '../hud/index.js';
 import { teamCommand } from './team.js';
 import { ralphCommand } from './ralph.js';
+import { askCommand } from './ask.js';
+import { exploreCommand } from './explore.js';
+import { sparkshellCommand } from './sparkshell.js';
+import { agentsInitCommand } from './agents-init.js';
+import { sessionCommand } from './session-search.js';
+import {
+  MADMAX_FLAG,
+  CODEX_BYPASS_FLAG,
+  HIGH_REASONING_FLAG,
+  XHIGH_REASONING_FLAG,
+  SPARK_FLAG,
+  MADMAX_SPARK_FLAG,
+  CONFIG_FLAG,
+  LONG_CONFIG_FLAG,
+} from './constants.js';
 import {
   getBaseStateDir,
   getStateDir,
@@ -25,9 +39,10 @@ import { maybeCheckAndPromptUpdate } from './update.js';
 import { maybePromptGithubStar } from './star-prompt.js';
 import {
   generateOverlay,
-  writeSessionModelInstructionsFile,
   removeSessionModelInstructionsFile,
+  resolveSessionOrchestrationMode,
   sessionModelInstructionsPath,
+  writeSessionModelInstructionsFile,
 } from '../hooks/agents-overlay.js';
 import {
   readSessionState, isSessionStale, writeSessionStart, writeSessionEnd, resetSessionMetrics,
@@ -44,6 +59,7 @@ import {
   buildUnregisterResizeHookArgs,
   enableMouseScrolling,
   isNativeWindows,
+  isTmuxAvailable,
   isWsl2,
 } from '../team/tmux-session.js';
 import {
@@ -56,6 +72,7 @@ import {
 import { getPackageRoot } from '../utils/package.js';
 import { codexConfigPath } from '../utils/paths.js';
 import { HUD_TMUX_HEIGHT_LINES } from '../hud/constants.js';
+import { classifySpawnError, spawnPlatformCommandSync } from '../utils/platform-command.js';
 import { buildHookEvent } from '../hooks/extensibility/events.js';
 import { dispatchHookEvent } from '../hooks/extensibility/dispatcher.js';
 import {
@@ -68,22 +85,41 @@ import {
   planWorktreeTarget,
   ensureWorktree,
 } from '../team/worktree.js';
+import {
+  OMX_NOTIFY_TEMP_CONTRACT_ENV,
+  parseNotifyTempContractFromArgs,
+  serializeNotifyTempContract,
+  type NotifyTempContract,
+  type ParseNotifyTempContractResult,
+} from '../notifications/temp-contract.js';
 
 const HELP = `
 oh-my-codex (omx) - Multi-agent orchestration for Codex CLI
 
 Usage:
   omx           Launch Codex CLI (HUD auto-attaches only when already inside tmux)
-  omx setup     Install skills, prompts, MCP servers, and AGENTS.md
+  omx setup     Install skills, prompts, MCP servers, and scope-specific AGENTS.md
   omx uninstall Remove OMX configuration and clean up installed artifacts
   omx doctor    Check installation health
   omx doctor --team  Check team/swarm runtime health diagnostics
+  omx ask       Ask local provider CLI (claude|gemini) and write artifact output
+  omx resume    Resume a previous interactive Codex session
+  omx explore   Default read-only exploration entrypoint (may adaptively use sparkshell backend)
+  omx session   Search prior local session transcripts and history artifacts
+  omx agents-init [path]
+                Bootstrap lightweight AGENTS.md files for a repo/subtree
+  omx deepinit [path]
+                Alias for agents-init (lightweight AGENTS bootstrap only)
   omx team      Spawn parallel worker panes in tmux and bootstrap inbox/task state
   omx ralph     Launch Codex with ralph persistence mode active
   omx version   Show version information
   omx tmux-hook Manage tmux prompt injection workaround (init|status|validate|test)
   omx hooks     Manage hook plugins (init|status|validate|test)
   omx hud       Show HUD statusline (--watch, --json, --preset=NAME)
+  omx sparkshell <command> [args...]
+  omx sparkshell --tmux-pane <pane-id> [--tail-lines <100-1000>]
+                Run native sparkshell sidecar for direct command execution or explicit tmux-pane summarization
+                (also used as an adaptive backend for qualifying read-only explore tasks)
   omx help      Show this help message
   omx status    Show active modes and state
   omx cancel    Cancel active execution modes
@@ -101,6 +137,12 @@ Options:
                 Workers get the configured low-complexity team model; leader model unchanged
   --madmax-spark  spark model for workers + bypass approvals for leader and workers
                 (shorthand for: --spark --madmax)
+  --notify-temp  Enable temporary notification routing for this run/session only
+  --discord      Select Discord provider for temporary notification mode
+  --slack        Select Slack provider for temporary notification mode
+  --telegram     Select Telegram provider for temporary notification mode
+  --custom <name>
+                Select custom/OpenClaw gateway name for temporary notification mode
   -w, --worktree[=<name>]
                 Launch Codex in a git worktree (detached when no name is given)
   --force       Force reinstall (overwrite existing files)
@@ -112,14 +154,6 @@ Options:
                 user | project
 `;
 
-const MADMAX_FLAG = '--madmax';
-const CODEX_BYPASS_FLAG = '--dangerously-bypass-approvals-and-sandbox';
-const HIGH_REASONING_FLAG = '--high';
-const XHIGH_REASONING_FLAG = '--xhigh';
-const SPARK_FLAG = '--spark';
-const MADMAX_SPARK_FLAG = '--madmax-spark';
-const CONFIG_FLAG = '-c';
-const LONG_CONFIG_FLAG = '--config';
 const REASONING_KEY = 'model_reasoning_effort';
 const MODEL_INSTRUCTIONS_FILE_KEY = 'model_instructions_file';
 const TEAM_WORKER_LAUNCH_ARGS_ENV = 'OMX_TEAM_WORKER_LAUNCH_ARGS';
@@ -130,8 +164,28 @@ const REASONING_MODES = ['low', 'medium', 'high', 'xhigh'] as const;
 type ReasoningMode = typeof REASONING_MODES[number];
 const REASONING_MODE_SET = new Set<string>(REASONING_MODES);
 const REASONING_USAGE = 'Usage: omx reasoning <low|medium|high|xhigh>';
+const ALLOWED_SHELLS = new Set([
+  '/bin/sh', '/bin/bash', '/bin/zsh', '/bin/dash', '/bin/fish',
+  '/usr/bin/sh', '/usr/bin/bash', '/usr/bin/zsh', '/usr/bin/dash', '/usr/bin/fish',
+  '/usr/local/bin/bash', '/usr/local/bin/zsh', '/usr/local/bin/fish',
+]);
+const WINDOWS_DETACHED_BOOTSTRAP_DELAY_MS = 2500;
 
-type CliCommand = 'launch' | 'setup' | 'uninstall' | 'doctor' | 'team' | 'version' | 'tmux-hook' | 'hooks' | 'hud' | 'status' | 'cancel' | 'help' | 'reasoning' | string;
+type CliCommand = 'launch' | 'setup' | 'agents-init' | 'deepinit' | 'uninstall' | 'doctor' | 'ask' | 'explore' | 'sparkshell' | 'team' | 'session' | 'resume' | 'version' | 'tmux-hook' | 'hooks' | 'hud' | 'status' | 'cancel' | 'help' | 'reasoning' | string;
+
+const NESTED_HELP_COMMANDS = new Set<CliCommand>([
+  'ask',
+  'agents-init',
+  'deepinit',
+  'hooks',
+  'hud',
+  'ralph',
+  'resume',
+  'session',
+  'sparkshell',
+  'team',
+  'tmux-hook',
+]);
 
 export interface ResolvedCliInvocation {
   command: CliCommand;
@@ -159,7 +213,8 @@ export function readPersistedSetupScope(cwd: string): SetupScope | undefined {
       const migrated = LEGACY_SCOPE_MIGRATION_SYNC[parsed.scope];
       if (migrated) return migrated;
     }
-  } catch {
+  } catch (err) {
+    process.stderr.write(`[cli/index] operation failed: ${err}\n`);
     // Ignore malformed persisted scope and use defaults.
   }
   return undefined;
@@ -203,13 +258,27 @@ export function resolveCliInvocation(args: string[]): ResolvedCliInvocation {
   if (firstArg === '--help' || firstArg === '-h') {
     return { command: 'help', launchArgs: [] };
   }
+  if (firstArg === '--version' || firstArg === '-v') {
+    return { command: 'version', launchArgs: [] };
+  }
   if (!firstArg || firstArg.startsWith('--')) {
     return { command: 'launch', launchArgs: firstArg ? args : [] };
   }
   if (firstArg === 'launch') {
     return { command: 'launch', launchArgs: args.slice(1) };
   }
+  if (firstArg === 'resume') {
+    return { command: 'resume', launchArgs: args.slice(1) };
+  }
   return { command: firstArg, launchArgs: [] };
+}
+
+export function resolveNotifyTempContract(args: string[], env: NodeJS.ProcessEnv = process.env): ParseNotifyTempContractResult {
+  return parseNotifyTempContractFromArgs(args, env);
+}
+
+export function commandOwnsLocalHelp(command: CliCommand): boolean {
+  return NESTED_HELP_COMMANDS.has(command);
 }
 
 export type CodexLaunchPolicy = 'inside-tmux' | 'direct';
@@ -222,6 +291,10 @@ type ExecFileSyncFailure = NodeJS.ErrnoException & {
   status?: number | null;
   signal?: NodeJS.Signals | null;
 };
+
+function hasErrnoCode(error: unknown, code: string): boolean {
+  return Boolean(error && typeof error === 'object' && 'code' in error && error.code === code);
+}
 
 export interface CodexExecFailureClassification {
   kind: 'exit' | 'launch-error';
@@ -274,24 +347,33 @@ export function classifyCodexExecFailure(error: unknown): CodexExecFailureClassi
 }
 
 function runCodexBlocking(cwd: string, launchArgs: string[], codexEnv: NodeJS.ProcessEnv): void {
-  try {
-    execFileSync('codex', launchArgs, { cwd, stdio: 'inherit', env: codexEnv });
-  } catch (error) {
-    const classified = classifyCodexExecFailure(error);
-    if (classified.kind === 'exit') {
-      process.exitCode = classified.exitCode ?? 1;
-      if (classified.signal) {
-        console.error(`[omx] codex exited due to signal ${classified.signal}`);
-      }
-      return;
-    }
+  const { result } = spawnPlatformCommandSync('codex', launchArgs, {
+    cwd,
+    stdio: 'inherit',
+    env: codexEnv,
+    encoding: 'utf-8',
+  });
 
-    if (classified.code === 'ENOENT') {
+  if (result.error) {
+    const errno = result.error as NodeJS.ErrnoException;
+    const kind = classifySpawnError(errno);
+    if (kind === 'missing') {
       console.error('[omx] failed to launch codex: executable not found in PATH');
+    } else if (kind === 'blocked') {
+      console.error(`[omx] failed to launch codex: executable is present but blocked in the current environment (${errno.code || 'blocked'})`);
     } else {
-      console.error(`[omx] failed to launch codex: ${classified.message}`);
+      console.error(`[omx] failed to launch codex: ${errno.message}`);
     }
-    throw error;
+    throw result.error;
+  }
+
+  if (result.status !== 0) {
+    process.exitCode = typeof result.status === 'number'
+      ? result.status
+      : resolveSignalExitCode(result.signal);
+    if (result.signal) {
+      console.error(`[omx] codex exited due to signal ${result.signal}`);
+    }
   }
 }
 
@@ -350,7 +432,7 @@ export function buildHudPaneCleanupTargets(existingPaneIds: string[], createdPan
 
 export async function main(args: string[]): Promise<void> {
   const knownCommands = new Set([
-    'launch', 'setup', 'uninstall', 'doctor', 'team', 'ralph', 'version', 'tmux-hook', 'hooks', 'hud', 'status', 'cancel', 'help', '--help', '-h',
+    'launch', 'setup', 'agents-init', 'deepinit', 'uninstall', 'doctor', 'ask', 'explore', 'sparkshell', 'team', 'ralph', 'session', 'resume', 'version', 'tmux-hook', 'hooks', 'hud', 'status', 'cancel', 'help', '--help', '-h',
   ]);
   const firstArg = args[0];
   const { command, launchArgs } = resolveCliInvocation(args);
@@ -362,7 +444,7 @@ export async function main(args: string[]): Promise<void> {
     team: flags.has('--team'),
   };
 
-  if (flags.has('--help') || flags.has('-h')) {
+  if (flags.has('--help') && !commandOwnsLocalHelp(command)) {
     console.log(HELP);
     return;
   }
@@ -372,6 +454,9 @@ export async function main(args: string[]): Promise<void> {
       case 'launch':
         await launchWithHud(launchArgs);
         break;
+      case 'resume':
+        await launchWithHud(['resume', ...launchArgs]);
+        break;
       case 'setup':
         await setup({
           force: options.force,
@@ -379,6 +464,12 @@ export async function main(args: string[]): Promise<void> {
           verbose: options.verbose,
           scope: resolveSetupScopeArg(args.slice(1)),
         });
+        break;
+      case 'agents-init':
+        await agentsInitCommand(args.slice(1));
+        break;
+      case 'deepinit':
+        await agentsInitCommand(args.slice(1));
         break;
       case 'uninstall':
         await uninstall({
@@ -389,11 +480,25 @@ export async function main(args: string[]): Promise<void> {
           scope: resolveSetupScopeArg(args.slice(1)),
         });
         break;
-      case 'doctor':
+      case 'doctor': {
+        const { doctor } = await import('./doctor.js');
         await doctor(options);
+        break;
+      }
+      case 'ask':
+        await askCommand(args.slice(1));
+        break;
+      case 'explore':
+        await exploreCommand(args.slice(1));
+        break;
+      case 'sparkshell':
+        await sparkshellCommand(args.slice(1));
         break;
       case 'team':
         await teamCommand(args.slice(1), options);
+        break;
+      case 'session':
+        await sessionCommand(args.slice(1));
         break;
       case 'ralph':
         await ralphCommand(args.slice(1));
@@ -451,12 +556,19 @@ async function showStatus(): Promise<void> {
     }
     for (const path of states) {
       const content = await readFile(path, 'utf-8');
-      const state = JSON.parse(content);
+      let state: Record<string, unknown>;
+      try {
+        state = JSON.parse(content) as Record<string, unknown>;
+      } catch (err) {
+        process.stderr.write(`[cli/index] operation failed: ${err}\n`);
+        continue;
+      }
       const file = basename(path);
       const mode = file.replace('-state.json', '');
-      console.log(`${mode}: ${state.active ? 'ACTIVE' : 'inactive'} (phase: ${state.current_phase || 'n/a'})`);
+      console.log(`${mode}: ${state.active === true ? 'ACTIVE' : 'inactive'} (phase: ${String(state.current_phase || 'n/a')})`);
     }
-  } catch {
+  } catch (err) {
+    process.stderr.write(`[cli/index] operation failed: ${err}\n`);
     console.log('No active modes.');
   }
 }
@@ -499,25 +611,36 @@ async function reasoningCommand(args: string[]): Promise<void> {
 }
 
 export async function launchWithHud(args: string[]): Promise<void> {
-  // ── Win32 guard ──────────────────────────────────────────────────────
   if (isNativeWindows()) {
-    console.error(
-      '[omx] OMX requires tmux, which is not available on native Windows.\n' +
-      '[omx] Please use one of the following supported environments:\n' +
-      '[omx]   - WSL2 (Windows Subsystem for Linux 2)\n' +
-      '[omx]   - macOS\n' +
-      '[omx]   - Linux\n' +
-      '[omx] See: https://docs.microsoft.com/en-us/windows/wsl/install',
-    );
-    process.exitCode = 1;
-    return;
+    const { result } = spawnPlatformCommandSync('tmux', ['-V'], {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    if (result.error) {
+      const errno = result.error as NodeJS.ErrnoException;
+      const kind = classifySpawnError(errno);
+      if (kind === 'missing') {
+        console.warn(
+          '[omx] warning: tmux was not found on native Windows. Continuing without tmux/HUD.\n' +
+          '[omx] To enable tmux-backed features, install psmux:\n' +
+          '[omx]   winget install psmux\n' +
+          '[omx] See: https://github.com/marlocarlo/psmux',
+        );
+      } else {
+        console.warn(`[omx] warning: tmux probe failed on native Windows (${errno.code || errno.message}). Continuing without tmux/HUD.`);
+      }
+    } else if (result.status !== 0 && !isTmuxAvailable()) {
+      const stderr = (result.stderr || '').trim();
+      console.warn(`[omx] warning: tmux reported an error on native Windows${stderr ? ` (${stderr})` : ''}. Continuing without tmux/HUD.`);
+    }
   }
 
   const launchCwd = process.cwd();
   const parsedWorktree = parseWorktreeMode(args);
+  const notifyTempResult = resolveNotifyTempContract(parsedWorktree.remainingArgs, process.env);
   const codexHomeOverride = resolveCodexHomeForLaunch(launchCwd, process.env);
-  const workerSparkModel = resolveWorkerSparkModel(parsedWorktree.remainingArgs, codexHomeOverride);
-  const normalizedArgs = normalizeCodexLaunchArgs(parsedWorktree.remainingArgs);
+  const workerSparkModel = resolveWorkerSparkModel(notifyTempResult.passthroughArgs, codexHomeOverride);
+  const normalizedArgs = normalizeCodexLaunchArgs(notifyTempResult.passthroughArgs);
   let cwd = launchCwd;
   if (parsedWorktree.mode.enabled) {
     const planned = planWorktreeTarget({
@@ -534,19 +657,21 @@ export async function launchWithHud(args: string[]): Promise<void> {
 
   try {
     await maybeCheckAndPromptUpdate(cwd);
-  } catch {
+  } catch (err) {
+    process.stderr.write(`[cli/index] operation failed: ${err}\n`);
     // Non-fatal: update checks must never block launch
   }
 
   try {
     await maybePromptGithubStar();
-  } catch {
+  } catch (err) {
+    process.stderr.write(`[cli/index] operation failed: ${err}\n`);
     // Non-fatal: star prompt must never block launch
   }
 
   // ── Phase 1: preLaunch ──────────────────────────────────────────────────
   try {
-    await preLaunch(cwd, sessionId);
+    await preLaunch(cwd, sessionId, notifyTempResult.contract);
   } catch (err) {
     // preLaunch errors must NOT prevent Codex from starting
     console.error(`[omx] preLaunch warning: ${err instanceof Error ? err.message : err}`);
@@ -554,7 +679,10 @@ export async function launchWithHud(args: string[]): Promise<void> {
 
   // ── Phase 2: run ────────────────────────────────────────────────────────
   try {
-    runCodex(cwd, normalizedArgs, sessionId, workerSparkModel, codexHomeOverride);
+    const notifyTempContractRaw = notifyTempResult.contract.active
+      ? serializeNotifyTempContract(notifyTempResult.contract)
+      : null;
+    runCodex(cwd, normalizedArgs, sessionId, workerSparkModel, codexHomeOverride, notifyTempContractRaw);
   } finally {
     // ── Phase 3: postLaunch ─────────────────────────────────────────────
     await postLaunch(cwd, sessionId);
@@ -662,6 +790,65 @@ function shouldBypassDefaultSystemPrompt(env: NodeJS.ProcessEnv): boolean {
 function buildModelInstructionsOverride(cwd: string, env: NodeJS.ProcessEnv, defaultFilePath?: string): string {
   const filePath = env[OMX_MODEL_INSTRUCTIONS_FILE_ENV] || defaultFilePath || join(cwd, 'AGENTS.md');
   return `${MODEL_INSTRUCTIONS_FILE_KEY}="${escapeTomlString(filePath)}"`;
+}
+
+function tryReadGitValue(cwd: string, args: string[]): string | undefined {
+  try {
+    const value = execFileSync('git', args, {
+      cwd,
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 2000,
+    }).trim();
+    return value || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function extractIssueNumber(text: string): number | undefined {
+  const explicit = text.match(/\bissue\s*#(\d+)\b/i);
+  if (explicit) return Number.parseInt(explicit[1], 10);
+  const generic = text.match(/(^|[^\w/])#(\d+)\b/);
+  return generic ? Number.parseInt(generic[2], 10) : undefined;
+}
+
+function resolveNativeSessionName(cwd: string, sessionId: string): string {
+  if (process.env.TMUX) {
+    try {
+      const tmuxSession = execFileSync('tmux', ['display-message', '-p', '#S'], {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 2000,
+      }).trim();
+      if (tmuxSession) return tmuxSession;
+    } catch {
+      // best effort only
+    }
+  }
+  return buildTmuxSessionName(cwd, sessionId);
+}
+
+function buildNativeHookBaseContext(
+  cwd: string,
+  sessionId: string,
+  normalizedEvent: 'started' | 'blocked' | 'finished' | 'failed',
+  extra: Record<string, unknown> = {},
+): Record<string, unknown> {
+  const repoPath = tryReadGitValue(cwd, ['rev-parse', '--show-toplevel']) || cwd;
+  const branch = tryReadGitValue(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']);
+  const issueNumber = extractIssueNumber([branch, basename(cwd)].filter(Boolean).join(' '));
+
+  return {
+    normalized_event: normalizedEvent,
+    session_name: resolveNativeSessionName(cwd, sessionId),
+    repo_path: repoPath,
+    repo_name: basename(repoPath),
+    worktree_path: cwd,
+    ...(branch ? { branch } : {}),
+    ...(issueNumber !== undefined ? { issue_number: issueNumber } : {}),
+    ...extra,
+  };
 }
 
 export function injectModelInstructionsBypassArgs(
@@ -783,16 +970,8 @@ export function buildTmuxSessionName(cwd: string, sessionId: string): string {
     ? sanitizeTmuxToken(`${parentDir.slice(0, -'.omx-worktrees'.length)}-${dirName}`)
     : sanitizeTmuxToken(dirName);
   let branchToken = 'detached';
-  try {
-    const branch = execSync('git rev-parse --abbrev-ref HEAD', {
-      cwd,
-      encoding: 'utf-8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    }).trim();
-    if (branch) branchToken = sanitizeTmuxToken(branch);
-  } catch {
-    // Non-git directory or git unavailable.
-  }
+  const branch = tryReadGitValue(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']);
+  if (branch) branchToken = sanitizeTmuxToken(branch);
   const sessionToken = sanitizeTmuxToken(sessionId.replace(/^omx-/, ''));
   const name = `omx-${dirToken}-${branchToken}-${sessionToken}`;
   return name.length > 120 ? name.slice(0, 120) : name;
@@ -816,7 +995,8 @@ function detectDetachedSessionWindowIndex(sessionName: string): string | null {
       { encoding: 'utf-8' },
     );
     return parseWindowIndexFromTmuxOutput(output);
-  } catch {
+  } catch (err) {
+    process.stderr.write(`[cli/index] operation failed: ${err}\n`);
     return null;
   }
 }
@@ -828,12 +1008,15 @@ export function buildDetachedSessionBootstrapSteps(
   hudCmd: string,
   workerLaunchArgs: string | null,
   codexHomeOverride?: string,
+  notifyTempContractRaw?: string | null,
+  nativeWindows = false,
 ): DetachedSessionTmuxStep[] {
   const newSessionArgs: string[] = [
     'new-session', '-d', '-s', sessionName, '-c', cwd,
     ...(workerLaunchArgs ? ['-e', `${TEAM_WORKER_LAUNCH_ARGS_ENV}=${workerLaunchArgs}`] : []),
     ...(codexHomeOverride ? ['-e', `CODEX_HOME=${codexHomeOverride}`] : []),
-    codexCmd,
+    ...(notifyTempContractRaw ? ['-e', `${OMX_NOTIFY_TEMP_CONTRACT_ENV}=${notifyTempContractRaw}`] : []),
+    nativeWindows ? 'powershell.exe' : codexCmd,
   ];
   const splitCaptureArgs: string[] = [
     'split-window', '-v', '-l', String(HUD_TMUX_HEIGHT_LINES), '-d', '-t', sessionName,
@@ -851,9 +1034,10 @@ export function buildDetachedSessionFinalizeSteps(
   hookWindowIndex: string | null,
   enableMouse: boolean,
   wsl2: boolean,
+  nativeWindows = false,
 ): DetachedSessionTmuxStep[] {
   const steps: DetachedSessionTmuxStep[] = [];
-  if (hudPaneId && hookWindowIndex) {
+  if (!nativeWindows && hudPaneId && hookWindowIndex) {
     const hookTarget = buildResizeHookTarget(sessionName, hookWindowIndex);
     const hookName = buildResizeHookName('launch', sessionName, hookWindowIndex, hudPaneId);
     const clientAttachedHookName = buildClientAttachedReconcileHookName('launch', sessionName, hookWindowIndex, hudPaneId);
@@ -908,23 +1092,50 @@ export function buildDetachedSessionRollbackSteps(
   return steps;
 }
 
+
+export function buildNotifyTempStartupMessages(
+  contract: NotifyTempContract,
+  hasValidProviders: boolean,
+): { infoLines: string[]; warningLines: string[] } {
+  const providers = contract.canonicalSelectors.length > 0
+    ? contract.canonicalSelectors.join(',')
+    : 'none';
+  const infoLines = [
+    `notify temp: active | providers=${providers} | persistent-routing=bypassed`,
+  ];
+  const warningLines = [...contract.warnings];
+  if (!hasValidProviders) {
+    warningLines.push('notify temp: no valid providers resolved; notifications skipped');
+  }
+  return { infoLines, warningLines };
+}
+
 /**
  * preLaunch: Prepare environment before Codex starts.
  * 1. Orphan cleanup (stale session from a crashed launch)
  * 2. Generate runtime overlay + write session-scoped model instructions file
  * 3. Write session.json
  */
-async function preLaunch(cwd: string, sessionId: string): Promise<void> {
+async function preLaunch(cwd: string, sessionId: string, notifyTempContract?: NotifyTempContract): Promise<void> {
   // 1. Orphan cleanup
   const existingSession = await readSessionState(cwd);
   if (existingSession && isSessionStale(existingSession)) {
-    try { await removeSessionModelInstructionsFile(cwd, existingSession.session_id); } catch { /* best effort */ }
+    try {
+      await removeSessionModelInstructionsFile(cwd, existingSession.session_id);
+    } catch (err) {
+      process.stderr.write(`[cli/index] operation failed: ${err}\n`);
+    }
     const { unlink } = await import('fs/promises');
-    try { await unlink(join(cwd, '.omx', 'state', 'session.json')); } catch { /* best effort */ }
+    try {
+      await unlink(join(cwd, '.omx', 'state', 'session.json'));
+    } catch (err) {
+      process.stderr.write(`[cli/index] operation failed: ${err}\n`);
+    }
   }
 
   // 2. Generate runtime overlay + write session-scoped model instructions file
-  const overlay = await generateOverlay(cwd, sessionId);
+  const orchestrationMode = await resolveSessionOrchestrationMode(cwd, sessionId);
+  const overlay = await generateOverlay(cwd, sessionId, { orchestrationMode });
   await writeSessionModelInstructionsFile(cwd, sessionId, overlay);
 
   // 3. Write session state
@@ -934,26 +1145,43 @@ async function preLaunch(cwd: string, sessionId: string): Promise<void> {
   // 4. Start notify fallback watcher (best effort)
   try {
     await startNotifyFallbackWatcher(cwd);
-  } catch {
-    // Non-fatal
-  }
+    } catch (err) {
+      process.stderr.write(`[cli/index] operation failed: ${err}\n`);
+      // Non-fatal
+    }
 
   // 5. Start derived watcher (best effort, opt-in)
   try {
     await startHookDerivedWatcher(cwd);
-  } catch {
+  } catch (err) {
+    process.stderr.write(`[cli/index] operation failed: ${err}\n`);
     // Non-fatal
   }
 
-  // 6. Send session-start lifecycle notification (best effort)
+  // 6. Emit temp notification startup summary + warnings, then send session-start lifecycle notification (best effort)
   try {
+    if (notifyTempContract?.active) {
+      process.env[OMX_NOTIFY_TEMP_CONTRACT_ENV] = serializeNotifyTempContract(notifyTempContract);
+      const { getNotificationConfig } = await import('../notifications/config.js');
+      const resolved = getNotificationConfig();
+      const startup = buildNotifyTempStartupMessages(notifyTempContract, Boolean(resolved?.enabled));
+      for (const info of startup.infoLines) {
+        console.log(`[omx] ${info}`);
+      }
+      for (const warning of startup.warningLines) {
+        console.warn(`[omx] ${warning}`);
+      }
+    } else {
+      delete process.env[OMX_NOTIFY_TEMP_CONTRACT_ENV];
+    }
     const { notifyLifecycle } = await import('../notifications/index.js');
     await notifyLifecycle('session-start', {
       sessionId,
       projectPath: cwd,
       projectName: basename(cwd),
     });
-  } catch {
+  } catch (err) {
+    process.stderr.write(`[cli/index] operation failed: ${err}\n`);
     // Non-fatal: notification failures must never block launch
   }
 
@@ -961,12 +1189,14 @@ async function preLaunch(cwd: string, sessionId: string): Promise<void> {
   try {
     await emitNativeHookEvent(cwd, 'session-start', {
       session_id: sessionId,
-      context: {
+      context: buildNativeHookBaseContext(cwd, sessionId, 'started', {
         project_path: cwd,
         project_name: basename(cwd),
-      },
+        status: 'started',
+      }),
     });
-  } catch {
+  } catch (err) {
+    process.stderr.write(`[cli/index] operation failed: ${err}\n`);
     // Non-fatal
   }
 }
@@ -981,6 +1211,7 @@ function runCodex(
   sessionId: string,
   workerDefaultModel?: string,
   codexHomeOverride?: string,
+  notifyTempContractRaw?: string | null,
 ): void {
   const launchArgs = injectModelInstructionsBypassArgs(
     cwd,
@@ -1003,8 +1234,13 @@ function runCodex(
   const codexEnv = workerLaunchArgs
     ? { ...codexBaseEnv, [TEAM_WORKER_LAUNCH_ARGS_ENV]: workerLaunchArgs }
     : codexBaseEnv;
+  const codexEnvWithNotify = notifyTempContractRaw
+    ? { ...codexEnv, [OMX_NOTIFY_TEMP_CONTRACT_ENV]: notifyTempContractRaw }
+    : codexEnv;
 
-  if (resolveCodexLaunchPolicy(process.env) === 'inside-tmux') {
+  const launchPolicy = resolveCodexLaunchPolicy(process.env);
+
+  if (launchPolicy === 'inside-tmux') {
     // Already in tmux: launch codex in current pane, HUD in bottom split
     const currentPaneId = process.env.TMUX_PANE;
     const staleHudPaneIds = listHudWatchPaneIdsInCurrentWindow(currentPaneId);
@@ -1015,7 +1251,8 @@ function runCodex(
     let hudPaneId: string | null = null;
     try {
       hudPaneId = createHudWatchPane(cwd, hudCmd);
-    } catch {
+    } catch (err) {
+      process.stderr.write(`[cli/index] operation failed: ${err}\n`);
       // HUD split failed, continue without it
     }
 
@@ -1038,13 +1275,14 @@ function runCodex(
           }
           enableMouseScrolling(tmuxSession);
         }
-      } catch {
+      } catch (err) {
+        process.stderr.write(`[cli/index] operation failed: ${err}\n`);
         // Non-fatal: mouse scrolling is a convenience feature
       }
     }
 
     try {
-      runCodexBlocking(cwd, launchArgs, codexEnv);
+      runCodexBlocking(cwd, launchArgs, codexEnvWithNotify);
     } finally {
       const cleanupPaneIds = buildHudPaneCleanupTargets(
         listHudWatchPaneIdsInCurrentWindow(currentPaneId),
@@ -1068,9 +1306,17 @@ function runCodex(
         }
       }
     }
+  } else if (!isTmuxAvailable()) {
+    // Detached HUD sessions require tmux. Skip the bootstrap entirely when the
+    // binary is unavailable so direct launches do not emit noisy ENOENT logs.
+    runCodexBlocking(cwd, launchArgs, codexEnvWithNotify);
   } else {
     // Not in tmux: create a new tmux session with codex + HUD pane
+    const nativeWindows = isNativeWindows();
     const codexCmd = buildTmuxPaneCommand('codex', launchArgs);
+    const detachedWindowsCodexCmd = nativeWindows
+      ? buildWindowsPromptCommand('codex', launchArgs)
+      : null;
     const tmuxSessionId = `omx-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const sessionName = buildTmuxSessionName(cwd, tmuxSessionId);
     let createdDetachedSession = false;
@@ -1085,6 +1331,8 @@ function runCodex(
         hudCmd,
         workerLaunchArgs,
         codexHomeOverride,
+        notifyTempContractRaw,
+        nativeWindows,
       );
       for (const step of bootstrapSteps) {
         const output = execFileSync('tmux', step.args, { stdio: step.name === 'new-session' ? 'ignore' : 'pipe', encoding: 'utf-8' });
@@ -1109,12 +1357,17 @@ function runCodex(
             hookWindowIndex,
             process.env.OMX_MOUSE !== '0',
             isWsl2(),
+            nativeWindows,
           );
+          if (nativeWindows && detachedWindowsCodexCmd) {
+            scheduleDetachedWindowsCodexLaunch(sessionName, detachedWindowsCodexCmd);
+          }
           for (const finalizeStep of finalizeSteps) {
             const stdio = finalizeStep.name === 'attach-session' ? 'inherit' : 'ignore';
             try {
               execFileSync('tmux', finalizeStep.args, { stdio });
-            } catch {
+            } catch (err) {
+              process.stderr.write(`[cli/index] operation failed: ${err}\n`);
               if (finalizeStep.name === 'attach-session') throw new Error('failed to attach detached tmux session');
               continue;
             }
@@ -1128,7 +1381,8 @@ function runCodex(
           }
         }
       }
-    } catch {
+    } catch (err) {
+      process.stderr.write(`[cli/index] operation failed: ${err}\n`);
       if (createdDetachedSession) {
         const rollbackSteps = buildDetachedSessionRollbackSteps(
           sessionName,
@@ -1139,13 +1393,14 @@ function runCodex(
         for (const rollbackStep of rollbackSteps) {
           try {
             execFileSync('tmux', rollbackStep.args, { stdio: 'ignore' });
-          } catch {
+          } catch (err) {
+            process.stderr.write(`[cli/index] operation failed: ${err}\n`);
             // best-effort rollback only
           }
         }
       }
       // tmux not available or failed, just run codex directly
-      runCodexBlocking(cwd, launchArgs, codexEnv);
+      runCodexBlocking(cwd, launchArgs, codexEnvWithNotify);
     }
   }
 }
@@ -1158,7 +1413,8 @@ function listHudWatchPaneIdsInCurrentWindow(currentPaneId?: string): string[] {
       { encoding: 'utf-8' }
     );
     return findHudWatchPaneIds(parseTmuxPaneSnapshot(output), currentPaneId);
-  } catch {
+  } catch (err) {
+    process.stderr.write(`[cli/index] operation failed: ${err}\n`);
     return [];
   }
 }
@@ -1176,13 +1432,18 @@ function killTmuxPane(paneId: string): void {
   if (!paneId.startsWith('%')) return;
   try {
     execFileSync('tmux', ['kill-pane', '-t', paneId], { stdio: 'ignore' });
-  } catch {
+  } catch (err) {
+    process.stderr.write(`[cli/index] operation failed: ${err}\n`);
     // Pane may already be gone; ignore.
   }
 }
 
 export function buildTmuxShellCommand(command: string, args: string[]): string {
   return [quoteShellArg(command), ...args.map(quoteShellArg)].join(' ');
+}
+
+export function buildWindowsPromptCommand(command: string, args: string[]): string {
+  return ['&', quotePowerShellArg(command), ...args.map(quotePowerShellArg)].join(' ');
 }
 
 /**
@@ -1198,13 +1459,47 @@ export function buildTmuxPaneCommand(command: string, args: string[], shellPath:
   } else if (shellPath && /\/bash$/i.test(shellPath)) {
     rcSource = 'if [ -f ~/.bashrc ]; then source ~/.bashrc; fi; ';
   }
-  const shellBin = shellPath && shellPath.trim() !== '' ? shellPath : '/bin/sh';
+  const rawShell = shellPath && shellPath.trim() !== '' ? shellPath.trim() : '/bin/sh';
+  const shellBin = ALLOWED_SHELLS.has(rawShell) ? rawShell : '/bin/sh';
   const inner = `${rcSource}exec ${bareCmd}`;
   return `${quoteShellArg(shellBin)} -lc ${quoteShellArg(inner)}`;
 }
 
 function quoteShellArg(value: string): string {
   return `'${value.replace(/'/g, `'\"'\"'`)}'`;
+}
+
+function quotePowerShellArg(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+function buildDetachedWindowsBootstrapScript(
+  sessionName: string,
+  commandText: string,
+  delayMs: number = WINDOWS_DETACHED_BOOTSTRAP_DELAY_MS,
+): string {
+  const delay = Number.isFinite(delayMs) && delayMs > 0
+    ? Math.floor(delayMs)
+    : WINDOWS_DETACHED_BOOTSTRAP_DELAY_MS;
+  const targetLiteral = JSON.stringify(`${sessionName}:0.0`);
+  const commandLiteral = JSON.stringify(commandText);
+
+  return [
+    "const { execFileSync } = require('child_process');",
+    `setTimeout(() => {`,
+    `try { execFileSync('tmux', ['send-keys', '-t', ${targetLiteral}, '-l', '--', ${commandLiteral}], { stdio: 'ignore' }); } catch {}`,
+    `try { execFileSync('tmux', ['send-keys', '-t', ${targetLiteral}, 'C-m'], { stdio: 'ignore' }); } catch {}`,
+    `}, ${delay});`,
+  ].join('');
+}
+
+function scheduleDetachedWindowsCodexLaunch(sessionName: string, commandText: string): void {
+  const child = spawn(process.execPath, ['-e', buildDetachedWindowsBootstrapScript(sessionName, commandText)], {
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: true,
+  });
+  child.unref();
 }
 
 /**
@@ -1217,35 +1512,40 @@ async function postLaunch(cwd: string, sessionId: string): Promise<void> {
   try {
     const sessionState = await readSessionState(cwd);
     sessionStartedAt = sessionState?.started_at;
-  } catch {
+  } catch (err) {
+    process.stderr.write(`[cli/index] operation failed: ${err}\n`);
     // Non-fatal
   }
 
   // 0. Flush fallback watcher once to reduce race with fast codex exit.
   try {
     await flushNotifyFallbackOnce(cwd);
-  } catch {
+  } catch (err) {
+    process.stderr.write(`[cli/index] operation failed: ${err}\n`);
     // Non-fatal
   }
 
   // 0. Stop notify fallback watcher first.
   try {
     await stopNotifyFallbackWatcher(cwd);
-  } catch {
+  } catch (err) {
+    process.stderr.write(`[cli/index] operation failed: ${err}\n`);
     // Non-fatal
   }
 
   // 0. Flush derived watcher once on shutdown (opt-in, best effort).
   try {
     await flushHookDerivedWatcherOnce(cwd);
-  } catch {
+  } catch (err) {
+    process.stderr.write(`[cli/index] operation failed: ${err}\n`);
     // Non-fatal
   }
 
   // 0.1 Stop derived watcher first (opt-in, best effort).
   try {
     await stopHookDerivedWatcher(cwd);
-  } catch {
+  } catch (err) {
+    process.stderr.write(`[cli/index] operation failed: ${err}\n`);
     // Non-fatal
   }
 
@@ -1298,7 +1598,8 @@ async function postLaunch(cwd: string, sessionId: string): Promise<void> {
       durationMs,
       reason: 'session_exit',
     });
-  } catch {
+  } catch (err) {
+    process.stderr.write(`[cli/index] operation failed: ${err}\n`);
     // Non-fatal: notification failures must never block session cleanup
   }
 
@@ -1307,16 +1608,24 @@ async function postLaunch(cwd: string, sessionId: string): Promise<void> {
     const durationMs = sessionStartedAt
       ? Date.now() - new Date(sessionStartedAt).getTime()
       : undefined;
+    const normalizedEvent = process.exitCode && process.exitCode !== 0 ? 'failed' : 'finished';
+    const errorSummary = normalizedEvent === 'failed'
+      ? `codex exited with code ${process.exitCode}`
+      : undefined;
     await emitNativeHookEvent(cwd, 'session-end', {
       session_id: sessionId,
-      context: {
+      context: buildNativeHookBaseContext(cwd, sessionId, normalizedEvent, {
         project_path: cwd,
         project_name: basename(cwd),
         duration_ms: durationMs,
         reason: 'session_exit',
-      },
+        status: normalizedEvent === 'failed' ? 'failed' : 'finished',
+        ...(process.exitCode !== undefined ? { exit_code: process.exitCode } : {}),
+        ...(errorSummary ? { error_summary: errorSummary } : {}),
+      }),
     });
-  } catch {
+  } catch (err) {
+    process.stderr.write(`[cli/index] operation failed: ${err}\n`);
     // Non-fatal
   }
 }
@@ -1353,6 +1662,29 @@ function hookDerivedWatcherPidPath(cwd: string): string {
   return join(cwd, '.omx', 'state', 'hook-derived-watcher.pid');
 }
 
+function parseWatcherPidFile(content: string): number | null {
+  const trimmed = content.trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = JSON.parse(trimmed) as { pid?: unknown };
+    return typeof parsed.pid === 'number' && Number.isFinite(parsed.pid) && parsed.pid > 0 ? parsed.pid : null;
+  } catch {
+    const pid = Number.parseInt(trimmed, 10);
+    return Number.isFinite(pid) && pid > 0 ? pid : null;
+  }
+}
+
+function tryKillPid(pid: number, signal: NodeJS.Signals = 'SIGTERM'): boolean {
+  try {
+    process.kill(pid, signal);
+    return true;
+  } catch (error: unknown) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ESRCH') return false;
+    throw error;
+  }
+}
+
 async function startNotifyFallbackWatcher(cwd: string): Promise<void> {
   if (process.env.OMX_NOTIFY_FALLBACK === '0') return;
 
@@ -1366,15 +1698,17 @@ async function startNotifyFallbackWatcher(cwd: string): Promise<void> {
   // Stop stale watcher from a previous run.
   if (existsSync(pidPath)) {
     try {
-      const prev = JSON.parse(await readFile(pidPath, 'utf-8')) as { pid?: number };
-      if (prev && typeof prev.pid === 'number') {
-        process.kill(prev.pid, 'SIGTERM');
+      const prevPid = parseWatcherPidFile(await readFile(pidPath, 'utf-8'));
+      if (prevPid) {
+        tryKillPid(prevPid, 'SIGTERM');
       }
     } catch (error: unknown) {
-      console.warn('[omx] warning: failed to stop stale notify fallback watcher', {
-        path: pidPath,
-        error: error instanceof Error ? error.message : String(error),
-      });
+      if (!hasErrnoCode(error, 'ESRCH')) {
+        console.warn('[omx] warning: failed to stop stale notify fallback watcher', {
+          path: pidPath,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
     }
   }
 
@@ -1386,7 +1720,20 @@ async function startNotifyFallbackWatcher(cwd: string): Promise<void> {
   });
   const child = spawn(
     process.execPath,
-    [watcherScript, '--cwd', cwd, '--notify-script', notifyScript],
+    [
+      watcherScript,
+      '--cwd',
+      cwd,
+      '--notify-script',
+      notifyScript,
+      '--pid-file',
+      pidPath,
+      '--parent-pid',
+      String(process.pid),
+      ...(process.env.OMX_NOTIFY_FALLBACK_MAX_LIFETIME_MS
+        ? ['--max-lifetime-ms', process.env.OMX_NOTIFY_FALLBACK_MAX_LIFETIME_MS]
+        : []),
+    ],
     {
       cwd,
       detached: true,
@@ -1464,15 +1811,17 @@ async function stopNotifyFallbackWatcher(cwd: string): Promise<void> {
   if (!existsSync(pidPath)) return;
 
   try {
-    const parsed = JSON.parse(await readFile(pidPath, 'utf-8')) as { pid?: number };
-    if (parsed && typeof parsed.pid === 'number') {
-      process.kill(parsed.pid, 'SIGTERM');
+    const pid = parseWatcherPidFile(await readFile(pidPath, 'utf-8'));
+    if (pid) {
+      tryKillPid(pid, 'SIGTERM');
     }
   } catch (error: unknown) {
-    console.warn('[omx] warning: failed to stop notify fallback watcher process', {
-      path: pidPath,
-      error: error instanceof Error ? error.message : String(error),
-    });
+    if (!hasErrnoCode(error, 'ESRCH')) {
+      console.warn('[omx] warning: failed to stop notify fallback watcher process', {
+        path: pidPath,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   await unlink(pidPath).catch((error: unknown) => {
@@ -1548,10 +1897,17 @@ async function cancelModes(): Promise<void> {
 
     for (const ref of refs) {
       const content = await readFile(ref.path, 'utf-8');
+      let parsedState: Record<string, unknown>;
+      try {
+        parsedState = JSON.parse(content) as Record<string, unknown>;
+      } catch (err) {
+        process.stderr.write(`[cli/index] operation failed: ${err}\n`);
+        continue;
+      }
       states.set(ref.mode, {
         path: ref.path,
         scope: ref.scope,
-        state: JSON.parse(content) as Record<string, unknown>,
+        state: parsedState,
       });
     }
 
@@ -1617,7 +1973,8 @@ async function cancelModes(): Promise<void> {
     if (reported.size === 0) {
       console.log('No active modes to cancel.');
     }
-  } catch {
+  } catch (err) {
+    process.stderr.write(`[cli/index] operation failed: ${err}\n`);
     console.log('No active modes to cancel.');
   }
 }

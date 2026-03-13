@@ -5,12 +5,15 @@
 import { existsSync } from 'fs';
 import { readdir, readFile } from 'fs/promises';
 import { join } from 'path';
-import { execSync, spawnSync } from 'child_process';
 import {
   codexHome, codexConfigPath, codexPromptsDir,
   userSkillsDir, omxStateDir,
 } from '../utils/paths.js';
+import { classifySpawnError, spawnPlatformCommandSync } from '../utils/platform-command.js';
 import { getCatalogExpectations } from './catalog-contract.js';
+import { parse as parseToml } from '@iarna/toml';
+import { resolvePackagedExploreHarnessCommand, EXPLORE_BIN_ENV } from './explore.js';
+import { getPackageRoot } from '../utils/package.js';
 
 interface DoctorOptions {
   verbose?: boolean;
@@ -115,6 +118,9 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
   // Check 2: Node.js version
   checks.push(checkNodeVersion());
 
+  // Check 2.5: Explore harness readiness
+  checks.push(checkExploreHarness());
+
   // Check 3: Codex home directory
   checks.push(checkDirectory('Codex home', paths.codexHomeDir));
 
@@ -128,7 +134,7 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
   checks.push(await checkSkills(paths.skillsDir));
 
   // Check 7: AGENTS.md in project
-  checks.push(checkAgentsMd());
+  checks.push(checkAgentsMd(scopeResolution.scope, paths.codexHomeDir));
 
   // Check 8: State directory
   checks.push(checkDirectory('State dir', paths.stateDir));
@@ -359,7 +365,7 @@ function dedupeIssues(issues: TeamDoctorIssue[]): TeamDoctorIssue[] {
 }
 
 function listTeamTmuxSessions(): Set<string> | null {
-  const res = spawnSync('tmux', ['list-sessions', '-F', '#{session_name}'], { encoding: 'utf-8' });
+  const { result: res } = spawnPlatformCommandSync('tmux', ['list-sessions', '-F', '#{session_name}'], { encoding: 'utf-8' });
   if (res.error) {
     // tmux binary unavailable or not executable.
     return null;
@@ -382,20 +388,123 @@ function listTeamTmuxSessions(): Set<string> | null {
 }
 
 function checkCodexCli(): Check {
-  try {
-    const version = execSync('codex --version 2>/dev/null', { encoding: 'utf-8' }).trim();
-    return { name: 'Codex CLI', status: 'pass', message: `installed (${version})` };
-  } catch {
-    return { name: 'Codex CLI', status: 'fail', message: 'not found - install from https://github.com/openai/codex' };
+  const { result } = spawnPlatformCommandSync('codex', ['--version'], {
+    encoding: 'utf-8',
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  if (result.error) {
+    const code = (result.error as NodeJS.ErrnoException).code;
+    const kind = classifySpawnError(result.error as NodeJS.ErrnoException);
+    if (kind === 'missing') {
+      return { name: 'Codex CLI', status: 'fail', message: 'not found - install from https://github.com/openai/codex' };
+    }
+    if (kind === 'blocked') {
+      return {
+        name: 'Codex CLI',
+        status: 'fail',
+        message: `found but could not be executed in this environment (${code || 'blocked'})`,
+      };
+    }
+    return {
+      name: 'Codex CLI',
+      status: 'fail',
+      message: `probe failed - ${result.error.message}`,
+    };
   }
+  if (result.status === 0) {
+    const version = (result.stdout || '').trim();
+    return { name: 'Codex CLI', status: 'pass', message: `installed (${version})` };
+  }
+  const stderr = (result.stderr || '').trim();
+  return {
+    name: 'Codex CLI',
+    status: 'fail',
+    message: stderr !== '' ? `probe failed - ${stderr}` : `probe failed with exit ${result.status}`,
+  };
 }
 
 function checkNodeVersion(): Check {
-  const major = parseInt(process.versions.node.split('.')[0], 10);
+  const major = parseInt(process.versions.node.split('.')[0] ?? '0', 10);
+  if (isNaN(major)) {
+    return { name: 'Node.js', status: 'fail', message: `v${process.versions.node} (unable to parse major version)` };
+  }
   if (major >= 20) {
     return { name: 'Node.js', status: 'pass', message: `v${process.versions.node}` };
   }
   return { name: 'Node.js', status: 'fail', message: `v${process.versions.node} (need >= 20)` };
+}
+
+function checkExploreHarness(): Check {
+  const packageRoot = getPackageRoot();
+  const manifestPath = join(packageRoot, 'crates', 'omx-explore', 'Cargo.toml');
+  if (!existsSync(manifestPath)) {
+    return {
+      name: 'Explore Harness',
+      status: 'warn',
+      message: 'Rust harness sources not found in this install (omx explore unavailable until packaged or OMX_EXPLORE_BIN is set)',
+    };
+  }
+
+  const override = process.env[EXPLORE_BIN_ENV]?.trim();
+  if (override) {
+    const resolved = join(packageRoot, override);
+    if (existsSync(override) || existsSync(resolved)) {
+      return {
+        name: 'Explore Harness',
+        status: 'pass',
+        message: `${EXPLORE_BIN_ENV} configured (${override})`,
+      };
+    }
+    return {
+      name: 'Explore Harness',
+      status: 'warn',
+      message: `OMX_EXPLORE_BIN is set but path was not found (${override})`,
+    };
+  }
+
+  const packaged = resolvePackagedExploreHarnessCommand(packageRoot);
+  if (packaged) {
+    return {
+      name: 'Explore Harness',
+      status: 'pass',
+      message: `ready (packaged native binary: ${packaged.command})`,
+    };
+  }
+
+  const { result } = spawnPlatformCommandSync('cargo', ['--version'], {
+    encoding: 'utf-8',
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  if (result.error) {
+    const kind = classifySpawnError(result.error as NodeJS.ErrnoException);
+    if (kind === 'missing') {
+      return {
+        name: 'Explore Harness',
+        status: 'warn',
+        message: `Rust harness sources are packaged, but no compatible packaged prebuilt or cargo was found (install Rust or set ${EXPLORE_BIN_ENV} for omx explore)`,
+      };
+    }
+    return {
+      name: 'Explore Harness',
+      status: 'warn',
+      message: `Rust harness sources are packaged, but cargo probe failed (${result.error.message})`,
+    };
+  }
+
+  if (result.status === 0) {
+    const version = (result.stdout || '').trim();
+    return {
+      name: 'Explore Harness',
+      status: 'pass',
+      message: `ready (${version || 'cargo available'})`,
+    };
+  }
+
+  return {
+    name: 'Explore Harness',
+    status: 'warn',
+    message: `Rust harness sources are packaged, but cargo probe failed with exit ${result.status} (install Rust or set ${EXPLORE_BIN_ENV})`,
+  };
 }
 
 function checkDirectory(name: string, path: string): Check {
@@ -405,17 +514,52 @@ function checkDirectory(name: string, path: string): Check {
   return { name, status: 'warn', message: `${path} (not created yet)` };
 }
 
+function validateToml(content: string): string | null {
+  try {
+    parseToml(content);
+    return null;
+  } catch (error) {
+    if (error instanceof Error) {
+      return error.message;
+    }
+    return 'unknown TOML parse error';
+  }
+}
+
 async function checkConfig(configPath: string): Promise<Check> {
   if (!existsSync(configPath)) {
     return { name: 'Config', status: 'warn', message: 'config.toml not found' };
   }
+
   try {
     const content = await readFile(configPath, 'utf-8');
+    const tomlError = validateToml(content);
+
+    if (tomlError) {
+      const hint =
+        tomlError.includes("Can't redefine existing key") ||
+        tomlError.includes('duplicate') ||
+        tomlError.includes('[tui]')
+          ? 'possible duplicate TOML table such as [tui]'
+          : 'invalid TOML syntax';
+
+      return {
+        name: 'Config',
+        status: 'fail',
+        message: `invalid config.toml (${hint})`,
+      };
+    }
+
     const hasOmx = content.includes('omx_') || content.includes('oh-my-codex');
     if (hasOmx) {
       return { name: 'Config', status: 'pass', message: 'config.toml has OMX entries' };
     }
-    return { name: 'Config', status: 'warn', message: 'config.toml exists but no OMX entries' };
+
+    return {
+      name: 'Config',
+      status: 'warn',
+      message: 'config.toml exists but no OMX entries yet (expected before first setup; run "omx setup --force" once)',
+    };
   } catch {
     return { name: 'Config', status: 'fail', message: 'cannot read config.toml' };
   }
@@ -455,12 +599,28 @@ async function checkSkills(dir: string): Promise<Check> {
   }
 }
 
-function checkAgentsMd(): Check {
-  const agentsMd = join(process.cwd(), 'AGENTS.md');
-  if (existsSync(agentsMd)) {
+function checkAgentsMd(scope: DoctorSetupScope, codexHomeDir: string): Check {
+  if (scope === 'user') {
+    const userAgentsMd = join(codexHomeDir, 'AGENTS.md');
+    if (existsSync(userAgentsMd)) {
+      return { name: 'AGENTS.md', status: 'pass', message: `found in ${userAgentsMd}` };
+    }
+    return {
+      name: 'AGENTS.md',
+      status: 'warn',
+      message: `not found in ${userAgentsMd} (run omx setup --scope user)`,
+    };
+  }
+
+  const projectAgentsMd = join(process.cwd(), 'AGENTS.md');
+  if (existsSync(projectAgentsMd)) {
     return { name: 'AGENTS.md', status: 'pass', message: 'found in project root' };
   }
-  return { name: 'AGENTS.md', status: 'warn', message: 'not found in project root (run omx setup)' };
+  return {
+    name: 'AGENTS.md',
+    status: 'warn',
+    message: 'not found in project root (run omx agents-init . or omx setup --scope project)',
+  };
 }
 
 async function checkMcpServers(configPath: string): Promise<Check> {
@@ -475,7 +635,11 @@ async function checkMcpServers(configPath: string): Promise<Check> {
       if (hasOmx) {
         return { name: 'MCP Servers', status: 'pass', message: `${mcpCount} servers configured (OMX present)` };
       }
-      return { name: 'MCP Servers', status: 'warn', message: `${mcpCount} servers but no OMX servers` };
+      return {
+        name: 'MCP Servers',
+        status: 'warn',
+        message: `${mcpCount} servers but no OMX servers yet (expected before first setup; run "omx setup --force" once)`,
+      };
     }
     return { name: 'MCP Servers', status: 'warn', message: 'no MCP servers configured' };
   } catch {

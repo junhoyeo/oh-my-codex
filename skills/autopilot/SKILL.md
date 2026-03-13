@@ -32,23 +32,45 @@ Most non-trivial software tasks require coordinated phases: understanding requir
 - QA cycles repeat up to 5 times; if the same error persists 3 times, stop and report the fundamental issue
 - Validation requires approval from all reviewers; rejected items get fixed and re-validated
 - Cancel with `/cancel` at any time; progress is preserved for resume
+- If a deep-interview spec exists, use it as high-clarity phase input instead of re-expanding from scratch
+- If input is too vague for reliable expansion, offer/trigger `$deep-interview` first
+- Do not enter expansion/planning/execution-heavy phases until pre-context grounding exists; if fast execution is forced, proceed only with explicit risk notes
+- Default to concise, evidence-dense progress and completion reporting unless the user or risk level requires more detail
+- Treat newer user task updates as local overrides for the active workflow branch while preserving earlier non-conflicting constraints
+- If correctness depends on additional inspection, retrieval, execution, or verification, keep using the relevant tools until the workflow is grounded
+- Continue through clear, low-risk, reversible next steps automatically; ask only when the next step is materially branching, destructive, or preference-dependent
 </Execution_Policy>
 
 <Steps>
+0. **Pre-context Intake (required before Phase 0 starts)**:
+   - Derive a task slug from the request.
+   - Load the latest relevant snapshot from `.omx/context/{slug}-*.md` when available.
+   - If no snapshot exists, create `.omx/context/{slug}-{timestamp}.md` (UTC `YYYYMMDDTHHMMSSZ`) with:
+     - Task statement
+     - Desired outcome
+     - Known facts/evidence
+     - Constraints
+     - Unknowns/open questions
+     - Likely codebase touchpoints
+   - If ambiguity remains high, run `explore` first for brownfield facts, then run `$deep-interview --quick <task>` before proceeding.
+   - Carry the snapshot path into autopilot artifacts/state so all phases share grounded context.
+
 1. **Phase 0 - Expansion**: Turn the user's idea into a detailed spec
-   - Analyst (Opus): Extract requirements
-   - Architect (Opus): Create technical specification
+   - If `.omx/specs/deep-interview-*.md` exists for this task: reuse it and skip redundant expansion work
+   - If prompt is highly vague: route to `$deep-interview` for Socratic ambiguity-gated clarification
+   - Analyst (THOROUGH tier): Extract requirements
+   - Architect (THOROUGH tier): Create technical specification
    - Output: `.omx/plans/autopilot-spec.md`
 
 2. **Phase 1 - Planning**: Create an implementation plan from the spec
-   - Architect (Opus): Create plan (direct mode, no interview)
-   - Critic (Opus): Validate plan
+   - Architect (THOROUGH tier): Create plan (direct mode, no interview)
+   - Critic (THOROUGH tier): Validate plan
    - Output: `.omx/plans/autopilot-impl.md`
 
 3. **Phase 2 - Execution**: Implement the plan using Ralph + Ultrawork
-   - Executor-low (Haiku): Simple tasks
-   - Executor (Sonnet): Standard tasks
-   - Executor-high (Opus): Complex tasks
+   - LOW-tier executor/search roles: Simple tasks
+   - STANDARD-tier executor roles: Standard tasks
+   - THOROUGH-tier executor/architect roles: Complex tasks
    - Run independent tasks in parallel
 
 4. **Phase 3 - QA**: Cycle until all tests pass (UltraQA mode)
@@ -84,7 +106,7 @@ Most non-trivial software tasks require coordinated phases: understanding requir
 Use `omx_state` MCP tools for autopilot lifecycle state.
 
 - **On start**:
-  `state_write({mode: "autopilot", active: true, current_phase: "expansion", started_at: "<now>"})`
+  `state_write({mode: "autopilot", active: true, current_phase: "expansion", started_at: "<now>", state: {context_snapshot_path: "<snapshot-path>"}})`
 - **On phase transitions**:
   `state_write({mode: "autopilot", current_phase: "planning"})`
   `state_write({mode: "autopilot", current_phase: "execution"})`
@@ -94,6 +116,15 @@ Use `omx_state` MCP tools for autopilot lifecycle state.
   `state_write({mode: "autopilot", active: false, current_phase: "complete", completed_at: "<now>"})`
 - **On cancellation/cleanup**:
   run `$cancel` (which should call `state_clear(mode="autopilot")`)
+
+
+## Scenario Examples
+
+**Good:** The user says `continue` after the workflow already has a clear next step. Continue the current branch of work instead of restarting or re-asking the same question.
+
+**Good:** The user changes only the output shape or downstream delivery step (for example `make a PR`). Preserve earlier non-conflicting workflow constraints and apply the update locally.
+
+**Bad:** The user says `continue`, and the workflow restarts discovery or stops before the missing verification/evidence is gathered.
 
 <Examples>
 <Good>
@@ -121,7 +152,7 @@ Why bad: This is an exploration/brainstorming request. Respond conversationally 
 - Stop and report when the same QA error persists across 3 cycles (fundamental issue requiring human input)
 - Stop and report when validation keeps failing after 3 re-validation rounds
 - Stop when the user says "stop", "cancel", or "abort"
-- If requirements were too vague and expansion produces an unclear spec, pause and ask the user for clarification before proceeding
+- If requirements were too vague and expansion produces an unclear spec, pause and redirect to `$deep-interview` before proceeding
 </Escalation_And_Stop_Conditions>
 
 <Final_Checklist>
@@ -152,6 +183,18 @@ skipValidation = false
 ## Resume
 
 If autopilot was cancelled or failed, run `/autopilot` again to resume from where it stopped.
+
+## Recommended Clarity Pipeline
+
+For ambiguous requests, prefer:
+
+```
+deep-interview -> ralplan -> autopilot
+```
+
+- `deep-interview`: ambiguity-gated Socratic requirements
+- `ralplan`: consensus planning (planner/architect/critic)
+- `autopilot`: execution + QA + validation
 
 ## Best Practices for Input
 

@@ -13,9 +13,9 @@ Overrides default model selection to prefer cheaper tiers:
 
 | Default Tier | Ecomode Override |
 |--------------|------------------|
-| HIGH (opus) | MEDIUM (sonnet), HIGH only if essential |
-| MEDIUM (sonnet) | LOW (haiku) first, MEDIUM if fails |
-| LOW (haiku) | LOW (haiku) - no change |
+| THOROUGH | STANDARD, THOROUGH only if essential |
+| STANDARD | LOW first, STANDARD if needed |
+| LOW | LOW - no change |
 
 ## What Ecomode Does NOT Do
 
@@ -39,9 +39,9 @@ Ecomode is a modifier that combines with execution modes:
 
 | Decision | Rule |
 |----------|------|
-| DEFAULT | Start with LOW tier (Haiku) for most tasks |
-| UPGRADE | Escalate to MEDIUM (Sonnet) when LOW tier fails or task requires multi-file reasoning |
-| AVOID | HIGH tier (Opus) - only for planning/critique if essential |
+| DEFAULT | Start with LOW tier for most tasks |
+| UPGRADE | Escalate to STANDARD when LOW tier fails or task requires multi-file reasoning |
+| AVOID | THOROUGH tier - only for planning/critique if essential |
 
 ## Agent Selection in Ecomode
 
@@ -55,16 +55,16 @@ This provides the complete agent tier matrix, MCP tool assignments, and selectio
 
 ```
 // PREFERRED - Use for most tasks
-spawn_sub_agent(subagent_type="oh-my-codex:executor-low", model="haiku", prompt="...")
-spawn_sub_agent(subagent_type="oh-my-codex:explore", model="haiku", prompt="...")
-spawn_sub_agent(subagent_type="oh-my-codex:architect-low", model="haiku", prompt="...")
+delegate(role="executor", tier="LOW", task="...")
+delegate(role="explore", tier="LOW", task="...")
+delegate(role="architect", tier="LOW", task="...")
 
 // FALLBACK - Only if LOW fails
-spawn_sub_agent(subagent_type="oh-my-codex:executor", model="sonnet", prompt="...")
-spawn_sub_agent(subagent_type="oh-my-codex:architect-medium", model="sonnet", prompt="...")
+delegate(role="executor", tier="STANDARD", task="...")
+delegate(role="architect", tier="STANDARD", task="...")
 
 // AVOID - Only for planning/critique if essential
-spawn_sub_agent(subagent_type="oh-my-codex:planner", model="opus", prompt="...")
+delegate(role="planner", tier="THOROUGH", task="...")
 ```
 
 ## Delegation Enforcement
@@ -73,10 +73,10 @@ Ecomode maintains all delegation rules from core protocol with cost-optimized ro
 
 | Action | Delegate To | Model |
 |--------|-------------|-------|
-| Code changes | executor-low / executor | haiku / sonnet |
-| Analysis | architect-low | haiku |
-| Search | explore | haiku |
-| Documentation | writer | haiku |
+| Code changes | executor | LOW / STANDARD |
+| Analysis | architect | LOW |
+| Search | explore | LOW |
+| Documentation | writer | LOW |
 
 ### Background Execution
 Long-running commands (install, build, test) run in background. Maximum 20 concurrent.
@@ -84,10 +84,10 @@ Long-running commands (install, build, test) run in background. Maximum 20 concu
 ## Token Savings Tips
 
 1. **Batch similar tasks** to one agent instead of spawning many
-2. **Use explore (haiku)** for file discovery, not architect
-3. **Prefer executor-low** for simple changes - only upgrade if it fails
-4. **Use writer (haiku)** for all documentation tasks
-5. **Avoid opus agents** unless the task genuinely requires deep reasoning
+2. **Use explore (LOW tier)** for file discovery, not architect
+3. **Prefer LOW-tier executor routing** for simple changes - only upgrade if it fails
+4. **Use writer (LOW tier)** for all documentation tasks
+5. **Avoid THOROUGH-tier agents** unless the task genuinely requires deep reasoning
 
 ## Disabling Ecomode
 

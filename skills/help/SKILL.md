@@ -49,6 +49,14 @@ If you haven't configured OMX yet:
 
 This is the **only command** you need to know. It downloads the configuration and you're done.
 
+If you only need lightweight directory guidance scaffolding for `AGENTS.md` files, use:
+
+```bash
+omx agents-init .
+```
+
+That command is intentionally narrower than full setup: it only bootstraps `AGENTS.md` files for the target directory and its immediate child directories.
+
 ## For 2.x Users
 
 Your old commands still work! `/ralph`, `/ultrawork`, `/plan`, etc. all function exactly as before.
@@ -151,7 +159,7 @@ Format a summary with:
 
 TOKEN SUMMARY:
 - Total records: 1,234
-- By Model: opus 45%, sonnet 40%, haiku 15%
+- By Reasoning Effort: high 45%, medium 40%, low 15%
 
 TOP AGENTS:
 1. executor (234 uses)

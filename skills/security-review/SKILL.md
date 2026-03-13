@@ -19,7 +19,14 @@ This skill activates when:
 
 ## What It Does
 
-Delegates to the `security-reviewer` agent (Opus model) for deep security analysis:
+## GPT-5.4 Guidance Alignment
+
+- Default to concise, evidence-dense progress and completion reporting unless the user or risk level requires more detail.
+- Treat newer user task updates as local overrides for the active workflow branch while preserving earlier non-conflicting constraints.
+- If correctness depends on additional inspection, retrieval, execution, or verification, keep using the relevant tools until the security review is grounded.
+- Continue through clear, low-risk, reversible next steps automatically; ask only when the next step is materially branching, destructive, or preference-dependent.
+
+Delegates to the `security-reviewer` agent (THOROUGH tier) for deep security analysis:
 
 1. **OWASP Top 10 Scan**
    - A01: Broken Access Control
@@ -61,9 +68,9 @@ Delegates to the `security-reviewer` agent (Opus model) for deep security analys
 ## Agent Delegation
 
 ```
-spawn_sub_agent(
-  subagent_type="oh-my-codex:security-reviewer",
-  model="opus",
+delegate(
+  role="security-reviewer",
+  tier="THOROUGH",
   prompt="SECURITY REVIEW TASK
 
 Conduct comprehensive security audit of codebase.
@@ -253,6 +260,15 @@ The security-reviewer agent verifies:
 3. **Fix HIGH** - Important (within 1 week)
 4. **Fix MEDIUM** - Planned (within 1 month)
 5. **Fix LOW** - Backlog (when convenient)
+
+
+## Scenario Examples
+
+**Good:** The user says `continue` after the workflow already has a clear next step. Continue the current branch of work instead of restarting or re-asking the same question.
+
+**Good:** The user changes only the output shape or downstream delivery step (for example `make a PR`). Preserve earlier non-conflicting workflow constraints and apply the update locally.
+
+**Bad:** The user says `continue`, and the workflow restarts discovery or stops before the missing verification/evidence is gathered.
 
 ## Use with Other Skills
 

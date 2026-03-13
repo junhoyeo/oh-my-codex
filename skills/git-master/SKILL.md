@@ -16,7 +16,7 @@ Routes to the git-master agent for git operations.
 ## Routing
 
 ```
-spawn_sub_agent(subagent_type="oh-my-codex:git-master", model="sonnet", prompt="{{ARGUMENTS}}")
+delegate(role="git-master", tier="STANDARD", task="{{ARGUMENTS}}")
 ```
 
 ## Capabilities

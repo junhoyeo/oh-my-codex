@@ -5,16 +5,15 @@
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
-import { readFile, writeFile, mkdir } from 'fs/promises';
+import { readFile, writeFile, mkdir, rename } from 'fs/promises';
 import { join } from 'path';
 import { existsSync } from 'fs';
 import { parseNotepadPruneDaysOld } from './memory-validation.js';
-import { shouldAutoStartMcpServer } from './bootstrap.js';
+import { autoStartStdioMcpServer } from './bootstrap.js';
 import { resolveWorkingDirectoryForState } from './state-paths.js';
 
 function getMemoryPath(wd: string): string {
@@ -185,7 +184,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!existsSync(memPath)) {
         return text({ exists: false });
       }
-      const data: ProjectMemory = JSON.parse(await readFile(memPath, 'utf-8'));
+      let data: ProjectMemory = {};
+      try {
+        data = JSON.parse(await readFile(memPath, 'utf-8')) as ProjectMemory;
+      } catch {
+        data = {};
+      }
       const section = a.section as string | undefined;
       if (section && section !== 'all' && section in data) {
         return text((data as Record<string, unknown>)[section]);
@@ -199,7 +203,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const merge = a.merge as boolean;
       const newMem = a.memory as Record<string, unknown>;
       if (merge && existsSync(memPath)) {
-        const existing = JSON.parse(await readFile(memPath, 'utf-8'));
+        let existing: Record<string, unknown> = {};
+        try {
+          existing = JSON.parse(await readFile(memPath, 'utf-8')) as Record<string, unknown>;
+        } catch {
+          existing = {};
+        }
         const merged = { ...existing, ...newMem };
         await writeFile(memPath, JSON.stringify(merged, null, 2));
       } else {
@@ -213,7 +222,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       await mkdir(join(wd, '.omx'), { recursive: true });
       let data: ProjectMemory = {};
       if (existsSync(memPath)) {
-        data = JSON.parse(await readFile(memPath, 'utf-8'));
+        try {
+          data = JSON.parse(await readFile(memPath, 'utf-8')) as ProjectMemory;
+        } catch {
+          data = {};
+        }
       }
       if (!data.notes) data.notes = [];
       data.notes.push({
@@ -230,7 +243,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       await mkdir(join(wd, '.omx'), { recursive: true });
       let data: ProjectMemory = {};
       if (existsSync(memPath)) {
-        data = JSON.parse(await readFile(memPath, 'utf-8'));
+        try {
+          data = JSON.parse(await readFile(memPath, 'utf-8')) as ProjectMemory;
+        } catch {
+          data = {};
+        }
       }
       if (!data.directives) data.directives = [];
       data.directives.push({
@@ -262,9 +279,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const notePath = getNotepadPath(wd);
       await mkdir(join(wd, '.omx'), { recursive: true });
       const content = a.content as string;
-      let existing = existsSync(notePath) ? await readFile(notePath, 'utf-8') : '';
+      let existing: string;
+      try {
+        existing = await readFile(notePath, 'utf-8');
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+          existing = '';
+        } else {
+          throw err;
+        }
+      }
       existing = replaceSection(existing, 'PRIORITY', content.slice(0, 500));
-      await writeFile(notePath, existing);
+      const tmpPath = notePath + '.tmp.' + process.pid;
+      await writeFile(tmpPath, existing);
+      await rename(tmpPath, notePath);
       return text({ success: true });
     }
 
@@ -272,9 +300,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const notePath = getNotepadPath(wd);
       await mkdir(join(wd, '.omx'), { recursive: true });
       const entry = `\n[${new Date().toISOString()}] ${a.content as string}`;
-      let existing = existsSync(notePath) ? await readFile(notePath, 'utf-8') : '';
+      let existing: string;
+      try {
+        existing = await readFile(notePath, 'utf-8');
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+          existing = '';
+        } else {
+          throw err;
+        }
+      }
       existing = appendToSection(existing, 'WORKING MEMORY', entry);
-      await writeFile(notePath, existing);
+      const tmpPath = notePath + '.tmp.' + process.pid;
+      await writeFile(tmpPath, existing);
+      await rename(tmpPath, notePath);
       return text({ success: true });
     }
 
@@ -282,9 +321,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const notePath = getNotepadPath(wd);
       await mkdir(join(wd, '.omx'), { recursive: true });
       const entry = `\n${a.content as string}`;
-      let existing = existsSync(notePath) ? await readFile(notePath, 'utf-8') : '';
+      let existing: string;
+      try {
+        existing = await readFile(notePath, 'utf-8');
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+          existing = '';
+        } else {
+          throw err;
+        }
+      }
       existing = appendToSection(existing, 'MANUAL', entry);
-      await writeFile(notePath, existing);
+      const tmpPath = notePath + '.tmp.' + process.pid;
+      await writeFile(tmpPath, existing);
+      await rename(tmpPath, notePath);
       return text({ success: true });
     }
 
@@ -404,7 +454,4 @@ function appendToSection(content: string, section: string, entry: string): strin
   return content.slice(0, nextHeader) + entry + content.slice(nextHeader);
 }
 
-if (shouldAutoStartMcpServer('memory')) {
-  const transport = new StdioServerTransport();
-  server.connect(transport).catch(console.error);
-}
+autoStartStdioMcpServer('memory', server);

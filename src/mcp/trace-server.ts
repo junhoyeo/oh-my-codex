@@ -5,7 +5,6 @@
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -15,7 +14,7 @@ import { join } from 'path';
 import { createReadStream, existsSync } from 'fs';
 import { createInterface } from 'readline';
 import { listModeStateFilesWithScopePreference, resolveWorkingDirectoryForState } from './state-paths.js';
-import { shouldAutoStartMcpServer } from './bootstrap.js';
+import { autoStartStdioMcpServer } from './bootstrap.js';
 
 function text(data: unknown) {
   return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
@@ -70,7 +69,9 @@ async function* iterateLogEntries(logsDir: string): AsyncGenerator<TraceEntry> {
       if (!line.trim()) continue;
       try {
         yield JSON.parse(line) as TraceEntry;
-      } catch { /* skip malformed */ }
+      } catch (err) {
+        process.stderr.write(`[trace-server] operation failed: ${err}\n`);
+      }
     }
   }
 }
@@ -168,7 +169,9 @@ export async function readModeEvents(workingDirectory: string): Promise<ModeEven
           },
         });
       }
-    } catch { /* skip malformed */ }
+    } catch (err) {
+      process.stderr.write(`[trace-server] operation failed: ${err}\n`);
+    }
   }
 
   return events.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
@@ -190,7 +193,8 @@ async function readMetrics(omxDir: string): Promise<Metrics | null> {
   if (!existsSync(metricsPath)) return null;
   try {
     return JSON.parse(await readFile(metricsPath, 'utf-8'));
-  } catch {
+  } catch (err) {
+    process.stderr.write(`[trace-server] operation failed: ${err}\n`);
     return null;
   }
 }
@@ -329,7 +333,4 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 });
 
-if (shouldAutoStartMcpServer('trace')) {
-  const transport = new StdioServerTransport();
-  server.connect(transport).catch(console.error);
-}
+autoStartStdioMcpServer('trace', server);

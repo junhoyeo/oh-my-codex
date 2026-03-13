@@ -1,5 +1,5 @@
-import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { describe, it } from 'node:test';
 import {
   AGENT_DEFINITIONS,
   getAgent,
@@ -22,6 +22,10 @@ describe('agents/definitions', () => {
       const agent = AGENT_DEFINITIONS[name];
       assert.equal(agent.name, name);
       assert.ok(agent.description.length > 0);
+      assert.ok(agent.reasoningEffort.length > 0);
+      assert.ok(agent.posture.length > 0);
+      assert.ok(agent.modelClass.length > 0);
+      assert.ok(agent.routingRole.length > 0);
     }
   });
 
@@ -29,6 +33,7 @@ describe('agents/definitions', () => {
     const buildAgents = getAgentsByCategory('build');
     assert.ok(buildAgents.length > 0);
     assert.ok(buildAgents.some((agent) => agent.name === 'executor'));
+    assert.ok(buildAgents.some((agent) => agent.name === 'team-executor'));
 
     const allowed: AgentDefinition['category'][] = [
       'build',

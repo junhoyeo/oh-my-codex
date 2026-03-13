@@ -1,9 +1,9 @@
-import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { describe, it } from 'node:test';
 import type { AgentDefinition } from '../definitions.js';
 import { generateAgentToml, installNativeAgentConfigs } from '../native-config.js';
 
@@ -12,7 +12,10 @@ describe('agents/native-config', () => {
     const agent: AgentDefinition = {
       name: 'executor',
       description: 'Code implementation',
-      model: 'sonnet',
+      reasoningEffort: 'medium',
+      posture: 'deep-worker',
+      modelClass: 'standard',
+      routingRole: 'executor',
       tools: 'execution',
       category: 'build',
     };
@@ -24,6 +27,8 @@ describe('agents/native-config', () => {
     assert.match(toml, /model_reasoning_effort = "medium"/);
     assert.ok(!toml.includes('title: demo'));
     assert.ok(toml.includes('Instruction line'));
+    assert.ok(toml.includes('You are operating in the deep-worker posture.'));
+    assert.ok(toml.includes('- posture: deep-worker'));
 
     const tripleQuoteBlocks = toml.match(/"""/g) || [];
     assert.equal(tripleQuoteBlocks.length, 2, 'only TOML delimiters should remain as raw triple quotes');

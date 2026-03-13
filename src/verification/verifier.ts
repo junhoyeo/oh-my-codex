@@ -2,7 +2,7 @@
  * Verification Protocol for oh-my-codex
  *
  * Evidence-backed verification of task completion.
- * Sizing: small (haiku), standard (sonnet), large (opus)
+ * Sizing: small (low), standard (medium), large (high)
  */
 
 export interface VerificationResult {

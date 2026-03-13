@@ -5,11 +5,18 @@ description: N coordinated agents on shared task list using tmux-based orchestra
 
 # Team Skill
 
-`$team` is the tmux-based parallel execution mode for OMX. It starts real worker Codex and/or Claude CLI sessions in split panes and coordinates them through `.omx/state/team/...` files plus MCP team tools.
+`$team` is the tmux-based parallel execution mode for OMX. It starts real worker Codex and/or Claude CLI sessions in split panes and coordinates them through `.omx/state/team/...` files plus CLI team interop (`omx team api ...`) and state files.
 
 This skill is operationally sensitive. Treat it as an operator workflow, not a generic prompt pattern.
 
 ## What This Skill Must Do
+
+## GPT-5.4 Guidance Alignment
+
+- Default to concise, evidence-dense progress and completion reporting unless the user or risk level requires more detail.
+- Treat newer user task updates as local overrides for the active workflow branch while preserving earlier non-conflicting constraints.
+- If correctness depends on additional inspection, retrieval, execution, or verification, keep using the relevant tools until the team workflow is grounded.
+- Continue through clear, low-risk, reversible next steps automatically; ask only when the next step is materially branching, destructive, or preference-dependent.
 
 When user triggers `$team`, the agent must:
 
@@ -34,6 +41,24 @@ omx team 3:executor "analyze feature X and report flaws"
 omx team "debug flaky integration tests"
 omx team ralph "ship end-to-end fix with verification"
 ```
+
+### Why `team ralph` exists as a linked launch path
+
+`omx team ralph ...` is not just shorthand for "run team now, decide on Ralph
+later." It creates a linked team+Ralph lifecycle from launch time while still
+using the normal `omx team` runtime startup path.
+
+- **Linked lifecycle/state:** launch marks team state with `linked_ralph`,
+  creates/updates Ralph state with `linked_team`, and team terminal phases can
+  propagate into Ralph state.
+- **Cleanup/shutdown:** linked cancellation and shutdown happen in order: team
+  cleanup first, then Ralph terminalization/cleanup metadata.
+- **Operator choice:**
+  - use plain `omx team ...` when you only want coordinated workers
+  - use `omx team ralph ...` when persistent Ralph verification/cleanup is part
+    of the plan from the start
+  - use plain `team` and start Ralph later only when you want a deliberately
+    separate manual follow-up after reviewing output or changing scope
 
 ### Claude teammates (v0.6.0+)
 
@@ -69,6 +94,36 @@ tmux list-panes -F '#{pane_id}\t#{pane_start_command}' | rg 'hud --watch' || tru
 ```
 
 If duplicates exist, remove extras before `omx team` to prevent HUD ending up in worker stack.
+
+## Pre-context Intake Gate
+
+Before launching `omx team`, require a grounded context snapshot:
+
+1. Derive a task slug from the request.
+2. Reuse the latest relevant snapshot in `.omx/context/{slug}-*.md` when available.
+3. If none exists, create `.omx/context/{slug}-{timestamp}.md` (UTC `YYYYMMDDTHHMMSSZ`) with:
+   - task statement
+   - desired outcome
+   - known facts/evidence
+   - constraints
+   - unknowns/open questions
+   - likely codebase touchpoints
+4. If ambiguity remains high, run `explore` first for brownfield facts, then run `$deep-interview --quick <task>` before team launch.
+
+Do not start worker panes until this gate is satisfied; if forced to proceed quickly, state explicit scope/risk limitations in the launch report.
+
+For simple read-only brownfield lookups during intake, follow active session guidance: when `USE_OMX_EXPLORE_CMD` is enabled, prefer `omx explore` with narrow, concrete prompts; otherwise use the richer normal explore path and fall back normally if `omx explore` is unavailable.
+
+## Follow-up Staffing Contract
+
+When `$team` is used as a follow-up mode from ralplan, carry forward the approved plan's explicit **available-agent-types roster** and convert it into concrete staffing guidance before launch:
+
+- keep worker-role choices inside the known roster
+- state the recommended headcount and role counts
+- state the suggested reasoning level for each lane when available
+- explain why each lane exists (delivery, verification, specialist support)
+- include an explicit launch hint (`omx team ralph N "<task>"` / `$team ralph N "<task>"`) when the plan expects Ralph to verify after team delivery
+- if the ideal role is unavailable, choose the closest role from the roster and say so
 
 ## Current Runtime Behavior (As Implemented)
 
@@ -118,20 +173,25 @@ Team mode resolves worker **model flags** from one shared launch-arg set (not pe
 Model precedence (highest to lowest):
 1. Explicit worker model in `OMX_TEAM_WORKER_LAUNCH_ARGS`
 2. Inherited leader `--model` flag
-3. Injected low-complexity default: `gpt-5.3-codex-spark` (only when 1+2 are absent and team `agentType` is low-complexity)
+3. Low-complexity default from `OMX_DEFAULT_SPARK_MODEL` (legacy alias: `OMX_SPARK_MODEL`) when 1+2 are absent and team `agentType` is low-complexity
+
+Default-model rule:
+- Do **not** assume a frontier or spark model from recency or model-family heuristics.
+- Use `OMX_DEFAULT_FRONTIER_MODEL` for frontier-default guidance.
+- Use `OMX_DEFAULT_SPARK_MODEL` for spark/low-complexity worker-default guidance.
 
 Thinking-level rule (critical):
 - **No model-name heuristic mapping.**
-- Team runtime must **not** infer `model_reasoning_effort` from model strings (e.g., `spark`, `opus`, `mini`).
-- Worker thinking level is applied **only when explicitly provided** (leader/user launch args or explicit config).
-- If no explicit thinking value is provided, runtime leaves `model_reasoning_effort` unset.
+- Team runtime must **not** infer `model_reasoning_effort` from model-name substrings (e.g., `spark`, `high-capability`, `mini`).
+- When the leader assigns teammate roles/tasks, OMX allocates **per-worker reasoning effort dynamically** from the resolved worker role (`low`, `medium`, `high`).
+- Explicit launch args still win: if `OMX_TEAM_WORKER_LAUNCH_ARGS` already includes `-c model_reasoning_effort=...`, that explicit value overrides dynamic allocation for every worker.
 
 Normalization requirements:
 - Parse both `--model <value>` and `--model=<value>`
 - Remove duplicate/conflicting model flags
 - Emit exactly one final canonical flag: `--model <value>`
 - Preserve unrelated args in worker launch config
-- If explicit reasoning exists, preserve canonical `-c model_reasoning_effort="<level>"`; otherwise do not inject one
+- If explicit reasoning exists, preserve canonical `-c model_reasoning_effort="<level>"`; otherwise inject the worker role's default reasoning level
 
 ## Required Lifecycle (Operator Contract)
 
@@ -148,6 +208,37 @@ Follow this exact lifecycle when running `$team`:
 
 Do not run `shutdown` while workers are actively writing updates unless user explicitly requested abort/cancel.
 Do not treat ad-hoc pane typing as primary control flow when runtime/state evidence is available.
+
+### Active leader monitoring rule
+
+While a team is **ON/running**, the leader must not go blind. Keep checking live team state until terminal completion.
+
+Minimum acceptable loop:
+
+```bash
+sleep 30 && omx team status <team-name>
+```
+
+Repeat that check while the team stays active, or use `omx team await <team-name> --timeout-ms 30000 --json` when event-driven waiting is a better fit.
+
+If the leader gets a stale/team-stalled nudge, immediately run `omx team status <team-name>` before taking any manual intervention.
+
+## Message Dispatch Policy (CLI-first, state-first)
+
+To avoid brittle behavior, **message/task delivery must not be driven by ad-hoc tmux typing**.
+
+Required default path:
+
+1. Use `omx team ...` runtime lifecycle commands for orchestration.
+2. Use `omx team api ... --json` for mailbox/task mutations.
+3. Verify delivery via mailbox/state evidence (`mailbox/*.json`, task status, `omx team status`).
+
+Strict rules:
+
+- **MUST NOT** use direct `tmux send-keys` as the primary mechanism to deliver instructions/messages.
+- **MUST NOT** spam Enter/trigger keys without first checking runtime/state evidence.
+- **MUST** prefer durable state writes + runtime dispatch (`dispatch/requests.json`, mailbox, inbox).
+- Direct tmux interaction is **fallback-only** and only after failure checks (for example `worker_notify_failed:<worker>`) or explicit user request (for example “press enter”).
 
 ## Operational Commands
 
@@ -189,6 +280,31 @@ Semantics:
 - `.omx/state/team/<team>/workers/worker-<n>/status.json`
 - `.omx/state/team-leader-nudge.json`
 
+
+## Team Mutation Interop (CLI-first)
+
+Use `omx team api` for machine-readable mutation/reads instead of legacy `team_*` MCP tools.
+
+```bash
+omx team api <operation> --input '{"team_name":"my-team",...}' --json
+```
+
+Examples:
+
+```bash
+omx team api send-message --input '{"team_name":"my-team","from_worker":"worker-1","to_worker":"leader-fixed","body":"ACK"}' --json
+omx team api claim-task --input '{"team_name":"my-team","task_id":"1","worker":"worker-1"}' --json
+omx team api transition-task-status --input '{"team_name":"my-team","task_id":"1","from":"in_progress","to":"completed","claim_token":"<token>"}' --json
+```
+
+`--json` responses include stable metadata for automation:
+- `schema_version`
+- `timestamp`
+- `command`
+- `ok`
+- `operation`
+- `data` or `error`
+
 ## Team + Worker Protocol Notes
 
 Leader-to-worker:
@@ -198,8 +314,8 @@ Leader-to-worker:
 
 Worker-to-leader:
 
-- Send ACK to `leader-fixed` mailbox via `team_send_message`
-- Claim task via state API, execute, update task + status
+- Send ACK to `leader-fixed` mailbox via `omx team api send-message --json`
+- Claim/transition/release task lifecycle via `omx team api <operation> --json`
 
 Task ID rule (critical):
 
@@ -250,6 +366,7 @@ Use only after checking `omx team status <team>` and mailbox/state evidence:
 
 1. Capture pane tail to confirm current worker state:
    - `tmux capture-pane -t %<worker-pane> -p -S -120`
+   - If a larger-tail read or bounded summary would help, prefer explicit opt-in inspection via `omx sparkshell --tmux-pane %<worker-pane> --tail-lines 400` before improvising extra tmux commands.
 2. If the pane is stuck in an interactive state, safely return to idle prompt first:
    - optional interrupt `C-c` or escape flow (CLI-specific) once, then re-check pane capture
 3. Send one concise trigger (single line) and wait for evidence:
@@ -277,10 +394,10 @@ Checks:
 
 1. Worker pane capture shows inbox processing
 2. `.omx/state/team/<team>/mailbox/leader-fixed.json` exists
-3. Worker skill loaded and `team_send_message` called
+3. Worker skill loaded and `omx team api send-message --json` called
 4. Task-id mismatch not blocking worker flow
 
-### Worker logs `team_send_message ENOENT` / `team_update_task ENOENT`
+### Worker logs `omx team api ... ENOENT` (or legacy `team_send_message ENOENT` / `team_update_task ENOENT`)
 
 Meaning:
 - Team state path no longer exists while worker is still running.
@@ -342,6 +459,7 @@ When operating this skill, provide concrete progress evidence:
 
 Do not claim success without file/pane evidence.
 Do not claim clean completion if shutdown occurred with `in_progress>0`.
+Use `omx sparkshell --tmux-pane ...` as an explicit opt-in operator aid for pane inspection and summaries; keep raw `tmux capture-pane` evidence available for manual intervention and proof.
 
 ## MCP Job Lifecycle Tools
 
@@ -391,3 +509,11 @@ Two cleanup tools exist and must not be confused:
 - Worktree provisioning requires a git repository and can fail on branch/path collisions
 - send-keys interactions can be timing-sensitive under load
 - stale panes from prior runs can interfere until manually cleaned
+
+## Scenario Examples
+
+**Good:** The user says `continue` after the workflow already has a clear next step. Continue the current branch of work instead of restarting or re-asking the same question.
+
+**Good:** The user changes only the output shape or downstream delivery step (for example `make a PR`). Preserve earlier non-conflicting workflow constraints and apply the update locally.
+
+**Bad:** The user says `continue`, and the workflow restarts discovery or stops before the missing verification/evidence is gathered.

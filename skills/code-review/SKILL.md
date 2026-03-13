@@ -17,7 +17,14 @@ This skill activates when:
 
 ## What It Does
 
-Delegates to the `code-reviewer` agent (Opus model) for deep analysis:
+## GPT-5.4 Guidance Alignment
+
+- Default to concise, evidence-dense progress and completion reporting unless the user or risk level requires more detail.
+- Treat newer user task updates as local overrides for the active workflow branch while preserving earlier non-conflicting constraints.
+- If correctness depends on additional inspection, retrieval, execution, or verification, keep using the relevant tools until the review is grounded.
+- Continue through clear, low-risk, reversible next steps automatically; ask only when the next step is materially branching, destructive, or preference-dependent.
+
+Delegates to the `code-reviewer` agent (THOROUGH tier) for deep analysis:
 
 1. **Identify Changes**
    - Run `git diff` to find changed files
@@ -44,9 +51,9 @@ Delegates to the `code-reviewer` agent (Opus model) for deep analysis:
 ## Agent Delegation
 
 ```
-spawn_sub_agent(
-  subagent_type="oh-my-codex:code-reviewer",
-  model="opus",
+delegate(
+  role="code-reviewer",
+  tier="THOROUGH",
   prompt="CODE REVIEW TASK
 
 Review code changes for quality, security, and maintainability.
@@ -178,6 +185,15 @@ The code-reviewer agent checks:
 **APPROVE** - No CRITICAL or HIGH issues, minor improvements only
 **REQUEST CHANGES** - CRITICAL or HIGH issues present
 **COMMENT** - Only LOW/MEDIUM issues, no blocking concerns
+
+
+## Scenario Examples
+
+**Good:** The user says `continue` after the workflow already has a clear next step. Continue the current branch of work instead of restarting or re-asking the same question.
+
+**Good:** The user changes only the output shape or downstream delivery step (for example `make a PR`). Preserve earlier non-conflicting workflow constraints and apply the update locally.
+
+**Bad:** The user says `continue`, and the workflow restarts discovery or stops before the missing verification/evidence is gathered.
 
 ## Use with Other Skills
 

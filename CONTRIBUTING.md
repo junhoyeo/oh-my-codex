@@ -9,6 +9,7 @@ Thanks for contributing.
 
 ```bash
 npm install
+npm run lint
 npm run build
 npm test
 ```
@@ -20,6 +21,16 @@ npm link
 omx setup
 omx doctor
 ```
+
+### Team/state coverage gate (issue #454)
+
+CI enforces minimum coverage for critical team orchestration modules:
+
+```bash
+npm run coverage:team-critical
+```
+
+This command checks coverage for `dist/team/**` and `dist/state/**` and writes reports to `coverage/team/`.
 
 ### Release-readiness local verification
 
@@ -50,6 +61,12 @@ unset OMX_TEAM_WORKER OMX_TEAM_STATE_ROOT OMX_TEAM_LEADER_CWD OMX_TEAM_WORKER_CL
 2. Run `omx setup --force` to install it to `~/.codex/prompts/`
 3. Use `/prompts:my-agent` in Codex CLI
 
+### Prompt guidance contract
+
+Before changing `AGENTS.md`, `templates/AGENTS.md`, `prompts/*.md`, or the generated `developer_instructions` text in `src/config/generator.ts`, read [`docs/prompt-guidance-contract.md`](./docs/prompt-guidance-contract.md).
+
+That document defines the GPT-5.4 behavior contract contributors should preserve across prompt surfaces and explains how it differs from posture-aware routing metadata.
+
 ### Adding a new skill
 
 1. Create `skills/my-skill/SKILL.md` with the skill workflow
@@ -60,7 +77,7 @@ unset OMX_TEAM_WORKER OMX_TEAM_STATE_ROOT OMX_TEAM_LEADER_CWD OMX_TEAM_WORKER_CL
 
 1. Create a branch from `main`.
 2. Make focused changes.
-3. Run build and tests locally.
+3. Run lint, build, and tests locally.
 4. Open a pull request using the provided template.
 
 ## Commit style
@@ -83,6 +100,7 @@ docs: clarify setup steps for Codex CLI users
 - [ ] Scope is focused and clearly described
 - [ ] `npm run build` passes
 - [ ] `npm test` passes
+- [ ] `npm run lint` passes
 - [ ] Documentation updated when behavior changed
 - [ ] No unrelated formatting/refactor churn
 

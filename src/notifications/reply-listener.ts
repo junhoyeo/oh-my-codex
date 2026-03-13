@@ -230,7 +230,9 @@ function readPidFile(): number | null {
   try {
     if (!existsSync(PID_FILE_PATH)) return null;
     const content = readFileSync(PID_FILE_PATH, 'utf-8');
-    return parseInt(content.trim(), 10);
+    const pid = parseInt(content.trim(), 10);
+    if (isNaN(pid)) return null;
+    return pid;
   } catch {
     return null;
   }
@@ -400,7 +402,8 @@ async function pollDiscord(
     const remaining = response.headers.get('x-ratelimit-remaining');
     const reset = response.headers.get('x-ratelimit-reset');
     if (remaining !== null && parseInt(remaining, 10) < 2) {
-      const resetTime = reset ? parseFloat(reset) * 1000 : Date.now() + 10_000;
+      const parsed = reset ? parseFloat(reset) : Number.NaN;
+      const resetTime = Number.isFinite(parsed) ? parsed * 1000 : Date.now() + 10_000;
       discordBackoffUntil = resetTime;
       log(`WARN: Discord rate limit low (remaining: ${remaining}), backing off until ${new Date(resetTime).toISOString()}`);
     }

@@ -59,7 +59,8 @@ function groupByTopDir(files: string[]): Map<string, string[]> {
     const sep = f.indexOf('/');
     const dir = sep >= 0 ? f.slice(0, sep) : '.';
     if (!map.has(dir)) map.set(dir, []);
-    map.get(dir)!.push(f);
+    const arr = map.get(dir);
+    if (arr) arr.push(f);
   }
   return map;
 }
@@ -128,7 +129,8 @@ export async function generateCodebaseMap(cwd: string): Promise<string> {
           const parts = f.split('/');
           const subDir = parts.length >= 3 ? `src/${parts[1]}` : 'src';
           if (!subGrouped.has(subDir)) subGrouped.set(subDir, []);
-          subGrouped.get(subDir)!.push(f);
+          const arr = subGrouped.get(subDir);
+          if (arr) arr.push(f);
         }
         const sortedSubs = [...subGrouped.keys()].sort((a, b) => a.localeCompare(b));
         for (const sub of sortedSubs.slice(0, MAX_DIRS)) {

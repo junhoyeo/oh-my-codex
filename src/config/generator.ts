@@ -10,19 +10,25 @@
  *   3. [table] sections (mcp_servers, tui)
  */
 
-import { readFile, writeFile } from 'fs/promises';
-import { existsSync } from 'fs';
-import { join } from 'path';
-import { AGENT_DEFINITIONS } from '../agents/definitions.js';
-import { omxAgentsConfigDir } from '../utils/paths.js';
+import { readFile, writeFile } from "fs/promises";
+import { existsSync } from "fs";
+import { join } from "path";
+import { AGENT_DEFINITIONS } from "../agents/definitions.js";
+import { tryReadCatalogManifest } from "../catalog/reader.js";
+import { omxAgentsConfigDir } from "../utils/paths.js";
+import { DEFAULT_FRONTIER_MODEL } from "./models.js";
+import type { UnifiedMcpRegistryServer } from "./mcp-registry.js";
 
 interface MergeOptions {
   agentsConfigDir?: string;
+  modelOverride?: string;
+  sharedMcpServers?: UnifiedMcpRegistryServer[];
+  sharedMcpRegistrySource?: string;
   verbose?: boolean;
 }
 
 function escapeTomlString(value: string): string {
-  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
 // ---------------------------------------------------------------------------
@@ -31,50 +37,116 @@ function escapeTomlString(value: string): string {
 
 /** Keys we own at the TOML root level. Used for upsert + strip. */
 const OMX_TOP_LEVEL_KEYS = [
-  'notify',
-  'model_reasoning_effort',
-  'developer_instructions',
+  "notify",
+  "model_reasoning_effort",
+  "developer_instructions",
 ] as const;
 
-function getOmxTopLevelLines(pkgRoot: string): string[] {
-  const notifyHookPath = join(pkgRoot, 'scripts', 'notify-hook.js');
-  const escapedPath = escapeTomlString(notifyHookPath);
+const DEFAULT_SETUP_MODEL = DEFAULT_FRONTIER_MODEL;
+const DEFAULT_SETUP_MODEL_CONTEXT_WINDOW = 1000000;
+const DEFAULT_SETUP_MODEL_AUTO_COMPACT_TOKEN_LIMIT = 900000;
+const SHARED_MCP_REGISTRY_MARKER = "oh-my-codex (OMX) Shared MCP Registry Sync";
+const SHARED_MCP_REGISTRY_END_MARKER =
+  "# End oh-my-codex shared MCP registry sync";
 
-  return [
-    '# oh-my-codex top-level settings (must be before any [table])',
-    `notify = ["node", "${escapedPath}"]`,
-    'model_reasoning_effort = "high"',
-    `developer_instructions = "You have oh-my-codex installed. Use /prompts:architect, /prompts:executor, /prompts:planner for specialized agent roles. Workflow skills via $name: $ralph, $autopilot, $plan. AGENTS.md is your orchestration brain."`,
-  ];
+function unwrapTomlString(value: string | undefined): string | undefined {
+  return value?.match(/^"(.*)"$/)?.[1];
 }
 
-/**
- * Remove any existing OMX-owned top-level keys so we can re-insert them
- * cleanly.  Also removes the comment line that precedes them.
- */
-export function stripOmxTopLevelKeys(config: string): string {
+export function getRootModelName(config: string): string | undefined {
+  return unwrapTomlString(parseRootKeyValues(config).get("model"));
+}
+
+function parseRootKeyValues(config: string): Map<string, string> {
+  const values = new Map<string, string>();
+  const lines = config.split(/\r?\n/);
+  for (const line of lines) {
+    if (/^\s*\[/.test(line)) break;
+    const match = line.match(/^\s*([A-Za-z0-9_-]+)\s*=\s*(.+?)\s*$/);
+    if (!match) continue;
+    values.set(match[1], match[2]);
+  }
+  return values;
+}
+
+function getOmxTopLevelLines(
+  pkgRoot: string,
+  existingConfig = "",
+  modelOverride?: string,
+): string[] {
+  const notifyHookPath = join(pkgRoot, "scripts", "notify-hook.js");
+  const escapedPath = escapeTomlString(notifyHookPath);
+  const rootValues = parseRootKeyValues(existingConfig);
+
+  const lines = [
+    "# oh-my-codex top-level settings (must be before any [table])",
+    `notify = ["node", "${escapedPath}"]`,
+    'model_reasoning_effort = "high"',
+    `developer_instructions = "You have oh-my-codex installed. AGENTS.md is your orchestration brain and the main orchestration surface. Use /prompts:<role> and spawned role prompts for specialized subagent work. Use workflow skills via $name when explicitly invoked or clearly routed by AGENTS.md. Treat role prompts as narrower execution surfaces under AGENTS.md authority."`,
+  ];
+
+  const existingModel = rootValues.get("model");
+  const existingContextWindow = rootValues.get("model_context_window");
+  const existingAutoCompact = rootValues.get("model_auto_compact_token_limit");
+  const selectedModel =
+    modelOverride ?? unwrapTomlString(existingModel) ?? DEFAULT_SETUP_MODEL;
+
+  if (modelOverride || !existingModel) {
+    lines.push(`model = "${selectedModel}"`);
+  }
+
+  if (
+    selectedModel === DEFAULT_SETUP_MODEL &&
+    !existingContextWindow &&
+    !existingAutoCompact
+  ) {
+    lines.push(`model_context_window = ${DEFAULT_SETUP_MODEL_CONTEXT_WINDOW}`);
+    lines.push(
+      `model_auto_compact_token_limit = ${DEFAULT_SETUP_MODEL_AUTO_COMPACT_TOKEN_LIMIT}`,
+    );
+  }
+
+  return lines;
+}
+
+function stripRootLevelKeys(config: string, keys: readonly string[]): string {
   let lines = config.split(/\r?\n/);
 
-  // Remove the OMX top-level comment line
-  lines = lines.filter((l) => l.trim() !== '# oh-my-codex top-level settings (must be before any [table])');
+  if (
+    keys.some((key) =>
+      OMX_TOP_LEVEL_KEYS.includes(key as (typeof OMX_TOP_LEVEL_KEYS)[number]),
+    )
+  ) {
+    lines = lines.filter(
+      (l) =>
+        l.trim() !==
+        "# oh-my-codex top-level settings (must be before any [table])",
+    );
+  }
 
-  // Remove lines matching OMX-owned keys (only in root scope, i.e. before
-  // the first [table] header).
   const firstTable = lines.findIndex((l) => /^\s*\[/.test(l));
   const boundary = firstTable >= 0 ? firstTable : lines.length;
 
   const result: string[] = [];
   for (let i = 0; i < lines.length; i++) {
     if (i < boundary) {
-      const isOmxKey = OMX_TOP_LEVEL_KEYS.some((k) =>
-        new RegExp(`^\\s*${k}\\s*=`).test(lines[i])
+      const isManagedKey = keys.some((key) =>
+        new RegExp(`^\\s*${key}\\s*=`).test(lines[i]),
       );
-      if (isOmxKey) continue;
+      if (isManagedKey) continue;
     }
     result.push(lines[i]);
   }
 
-  return result.join('\n');
+  return result.join("\n");
+}
+
+/**
+ * Remove any existing OMX-owned top-level keys so we can re-insert them
+ * cleanly. Also removes the comment line that precedes them.
+ */
+export function stripOmxTopLevelKeys(config: string): string {
+  return stripRootLevelKeys(config, OMX_TOP_LEVEL_KEYS);
 }
 
 // ---------------------------------------------------------------------------
@@ -83,16 +155,18 @@ export function stripOmxTopLevelKeys(config: string): string {
 
 function upsertFeatureFlags(config: string): string {
   const lines = config.split(/\r?\n/);
-  const featuresStart = lines.findIndex((line) => /^\s*\[features\]\s*$/.test(line));
+  const featuresStart = lines.findIndex((line) =>
+    /^\s*\[features\]\s*$/.test(line),
+  );
 
   if (featuresStart < 0) {
     const base = config.trimEnd();
     const featureBlock = [
-      '[features]',
-      'multi_agent = true',
-      'child_agents_md = true',
-      '',
-    ].join('\n');
+      "[features]",
+      "multi_agent = true",
+      "child_agents_md = true",
+      "",
+    ].join("\n");
     if (base.length === 0) {
       return featureBlock;
     }
@@ -126,19 +200,19 @@ function upsertFeatureFlags(config: string): string {
   }
 
   if (multiAgentIdx >= 0) {
-    lines[multiAgentIdx] = 'multi_agent = true';
+    lines[multiAgentIdx] = "multi_agent = true";
   } else {
-    lines.splice(sectionEnd, 0, 'multi_agent = true');
+    lines.splice(sectionEnd, 0, "multi_agent = true");
     sectionEnd += 1;
   }
 
   if (childAgentsIdx >= 0) {
-    lines[childAgentsIdx] = 'child_agents_md = true';
+    lines[childAgentsIdx] = "child_agents_md = true";
   } else {
-    lines.splice(sectionEnd, 0, 'child_agents_md = true');
+    lines.splice(sectionEnd, 0, "child_agents_md = true");
   }
 
-  return lines.join('\n');
+  return lines.join("\n");
 }
 
 /**
@@ -147,7 +221,9 @@ function upsertFeatureFlags(config: string): string {
  */
 export function stripOmxFeatureFlags(config: string): string {
   const lines = config.split(/\r?\n/);
-  const featuresStart = lines.findIndex((line) => /^\s*\[features\]\s*$/.test(line));
+  const featuresStart = lines.findIndex((line) =>
+    /^\s*\[features\]\s*$/.test(line),
+  );
 
   if (featuresStart < 0) return config;
 
@@ -159,12 +235,12 @@ export function stripOmxFeatureFlags(config: string): string {
     }
   }
 
-  const omxFlags = ['multi_agent', 'child_agents_md', 'collab'];
+  const omxFlags = ["multi_agent", "child_agents_md", "collab"];
   const filtered: string[] = [];
   for (let i = 0; i < lines.length; i++) {
     if (i > featuresStart && i < sectionEnd) {
       const isOmxFlag = omxFlags.some((f) =>
-        new RegExp(`^\\s*${f}\\s*=`).test(lines[i])
+        new RegExp(`^\\s*${f}\\s*=`).test(lines[i]),
       );
       if (isOmxFlag) continue;
     }
@@ -172,7 +248,9 @@ export function stripOmxFeatureFlags(config: string): string {
   }
 
   // If [features] section is now empty, remove the header too
-  const newFeaturesStart = filtered.findIndex((l) => /^\s*\[features\]\s*$/.test(l));
+  const newFeaturesStart = filtered.findIndex((l) =>
+    /^\s*\[features\]\s*$/.test(l),
+  );
   if (newFeaturesStart >= 0) {
     let newSectionEnd = filtered.length;
     for (let i = newFeaturesStart + 1; i < filtered.length; i++) {
@@ -182,12 +260,12 @@ export function stripOmxFeatureFlags(config: string): string {
       }
     }
     const sectionContent = filtered.slice(newFeaturesStart + 1, newSectionEnd);
-    if (sectionContent.every((l) => l.trim() === '')) {
+    if (sectionContent.every((l) => l.trim() === "")) {
       filtered.splice(newFeaturesStart, newSectionEnd - newFeaturesStart);
     }
   }
 
-  return filtered.join('\n');
+  return filtered.join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -198,7 +276,10 @@ export function stripOmxFeatureFlags(config: string): string {
  * Check whether a TOML table name belongs to an OMX-defined agent.
  * Handles both `agents.name` and `agents."name"` forms.
  */
-function isOmxAgentSection(tableName: string, agentNames: Set<string>): boolean {
+function isOmxAgentSection(
+  tableName: string,
+  agentNames: Set<string>,
+): boolean {
   const m = tableName.match(/^agents\.(?:"([^"]+)"|(\w[\w-]*))$/);
   if (!m) return false;
   return agentNames.has(m[1] || m[2]);
@@ -234,7 +315,7 @@ function stripOrphanedOmxSections(config: string): string {
         // Remove preceding OMX comment lines and blank lines
         while (result.length > 0) {
           const last = result[result.length - 1];
-          if (last.trim() === '' || /^#\s*(OMX|oh-my-codex)/i.test(last)) {
+          if (last.trim() === "" || /^#\s*(OMX|oh-my-codex)/i.test(last)) {
             result.pop();
           } else {
             break;
@@ -254,16 +335,19 @@ function stripOrphanedOmxSections(config: string): string {
     i++;
   }
 
-  return result.join('\n');
+  return result.join("\n");
 }
 
 // ---------------------------------------------------------------------------
 // OMX [table] sections block (appended at end of file)
 // ---------------------------------------------------------------------------
 
-export function stripExistingOmxBlocks(config: string): { cleaned: string; removed: number } {
-  const marker = 'oh-my-codex (OMX) Configuration';
-  const endMarker = '# End oh-my-codex';
+export function stripExistingOmxBlocks(config: string): {
+  cleaned: string;
+  removed: number;
+} {
+  const marker = "oh-my-codex (OMX) Configuration";
+  const endMarker = "# End oh-my-codex";
   let cleaned = config;
   let removed = 0;
 
@@ -271,13 +355,16 @@ export function stripExistingOmxBlocks(config: string): { cleaned: string; remov
     const markerIdx = cleaned.indexOf(marker);
     if (markerIdx < 0) break;
 
-    let blockStart = cleaned.lastIndexOf('\n', markerIdx);
+    let blockStart = cleaned.lastIndexOf("\n", markerIdx);
     blockStart = blockStart >= 0 ? blockStart + 1 : 0;
 
     const previousLineEnd = blockStart - 1;
     if (previousLineEnd >= 0) {
-      const previousLineStart = cleaned.lastIndexOf('\n', previousLineEnd - 1);
-      const previousLine = cleaned.slice(previousLineStart + 1, previousLineEnd);
+      const previousLineStart = cleaned.lastIndexOf("\n", previousLineEnd - 1);
+      const previousLine = cleaned.slice(
+        previousLineStart + 1,
+        previousLineEnd,
+      );
       if (/^# =+$/.test(previousLine.trim())) {
         blockStart = previousLineStart >= 0 ? previousLineStart + 1 : 0;
       }
@@ -286,35 +373,145 @@ export function stripExistingOmxBlocks(config: string): { cleaned: string; remov
     let blockEnd = cleaned.length;
     const endIdx = cleaned.indexOf(endMarker, markerIdx);
     if (endIdx >= 0) {
-      const endLineBreak = cleaned.indexOf('\n', endIdx);
+      const endLineBreak = cleaned.indexOf("\n", endIdx);
       blockEnd = endLineBreak >= 0 ? endLineBreak + 1 : cleaned.length;
     }
 
     const before = cleaned.slice(0, blockStart).trimEnd();
     const after = cleaned.slice(blockEnd).trimStart();
-    cleaned = [before, after].filter(Boolean).join('\n\n');
+    cleaned = [before, after].filter(Boolean).join("\n\n");
     removed += 1;
   }
 
   return { cleaned, removed };
 }
 
+export function stripExistingSharedMcpRegistryBlock(config: string): {
+  cleaned: string;
+  removed: number;
+} {
+  let cleaned = config;
+  let removed = 0;
+
+  while (true) {
+    const markerIdx = cleaned.indexOf(SHARED_MCP_REGISTRY_MARKER);
+    if (markerIdx < 0) break;
+
+    let blockStart = cleaned.lastIndexOf("\n", markerIdx);
+    blockStart = blockStart >= 0 ? blockStart + 1 : 0;
+
+    const previousLineEnd = blockStart - 1;
+    if (previousLineEnd >= 0) {
+      const previousLineStart = cleaned.lastIndexOf("\n", previousLineEnd - 1);
+      const previousLine = cleaned.slice(
+        previousLineStart + 1,
+        previousLineEnd,
+      );
+      if (/^# =+$/.test(previousLine.trim())) {
+        blockStart = previousLineStart >= 0 ? previousLineStart + 1 : 0;
+      }
+    }
+
+    let blockEnd = cleaned.length;
+    const endIdx = cleaned.indexOf(SHARED_MCP_REGISTRY_END_MARKER, markerIdx);
+    if (endIdx >= 0) {
+      const endLineBreak = cleaned.indexOf("\n", endIdx);
+      blockEnd = endLineBreak >= 0 ? endLineBreak + 1 : cleaned.length;
+    }
+
+    const before = cleaned.slice(0, blockStart).trimEnd();
+    const after = cleaned.slice(blockEnd).trimStart();
+    cleaned = [before, after].filter(Boolean).join("\n\n");
+    removed += 1;
+  }
+
+  return { cleaned, removed };
+}
+
+function toMcpServerTableKey(name: string): string {
+  if (/^[A-Za-z0-9_-]+$/.test(name)) {
+    return `mcp_servers.${name}`;
+  }
+  return `mcp_servers."${escapeTomlString(name)}"`;
+}
+
+function configHasMcpServer(config: string, name: string): boolean {
+  const tableName = toMcpServerTableKey(name).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`^\\s*\\[${tableName}\\]\\s*$`, "m").test(config);
+}
+
+function getSharedMcpRegistryBlock(
+  servers: UnifiedMcpRegistryServer[],
+  sourcePath: string | undefined,
+  existingConfig: string,
+): string {
+  if (servers.length === 0) return "";
+  const deduped = servers.filter((server) => !configHasMcpServer(existingConfig, server.name));
+  if (deduped.length === 0) return "";
+
+  const lines = [
+    "# ============================================================",
+    `# ${SHARED_MCP_REGISTRY_MARKER}`,
+    "# Managed by omx setup - edit the registry file instead",
+  ];
+  if (sourcePath) {
+    lines.push(`# Source: ${sourcePath}`);
+  }
+  lines.push("# ============================================================", "");
+
+  for (const server of deduped) {
+    lines.push(`# Shared MCP Server: ${server.name}`);
+    lines.push(`[${toMcpServerTableKey(server.name)}]`);
+    lines.push(`command = "${escapeTomlString(server.command)}"`);
+    lines.push(
+      `args = [${server.args
+        .map((arg) => `"${escapeTomlString(arg)}"`)
+        .join(", ")}]`,
+    );
+    lines.push(`enabled = ${server.enabled ? "true" : "false"}`);
+    if (typeof server.startupTimeoutSec === "number") {
+      lines.push(`startup_timeout_sec = ${server.startupTimeoutSec}`);
+    }
+    lines.push("");
+  }
+
+  lines.push("# ============================================================");
+  lines.push(SHARED_MCP_REGISTRY_END_MARKER);
+  return lines.join("\n");
+}
+
 /**
  * Generate [agents.<name>] entries for Codex native multi-agent support.
  * Each agent gets a description and config_file pointing to ~/.omx/agents/<name>.toml
  */
+
+function getInstallableAgentEntries(): Array<[string, (typeof AGENT_DEFINITIONS)[string]]> {
+  const manifest = tryReadCatalogManifest();
+  if (!manifest) {
+    return Object.entries(AGENT_DEFINITIONS);
+  }
+
+  const installable = new Set(
+    manifest.agents
+      .filter((agent) => agent.status === "active" || agent.status === "internal")
+      .map((agent) => agent.name),
+  );
+
+  return Object.entries(AGENT_DEFINITIONS).filter(([name]) => installable.has(name));
+}
+
 function getAgentEntries(agentsConfigDir: string): string[] {
   const entries: string[] = [
-    '',
-    '# OMX Native Agent Roles (Codex multi-agent)',
+    "",
+    "# OMX Native Agent Roles (Codex multi-agent)",
   ];
 
-  for (const [name, agent] of Object.entries(AGENT_DEFINITIONS)) {
+  for (const [name, agent] of getInstallableAgentEntries()) {
     // TOML table headers with special chars need quoting
-    const tableKey = name.includes('-') ? `agents."${name}"` : `agents.${name}`;
+    const tableKey = name.includes("-") ? `agents."${name}"` : `agents.${name}`;
     const configFile = escapeTomlString(join(agentsConfigDir, `${name}.toml`));
 
-    entries.push('');
+    entries.push("");
     entries.push(`[${tableKey}]`);
     entries.push(`description = "${agent.description}"`);
     entries.push(`config_file = "${configFile}"`);
@@ -328,63 +525,73 @@ function getAgentEntries(agentsConfigDir: string): string[] {
  * Contains ONLY [table] sections — no bare keys.
  */
 function getOmxTablesBlock(pkgRoot: string, agentsConfigDir: string): string {
-  const stateServerPath = escapeTomlString(join(pkgRoot, 'dist', 'mcp', 'state-server.js'));
-  const memoryServerPath = escapeTomlString(join(pkgRoot, 'dist', 'mcp', 'memory-server.js'));
-  const codeIntelServerPath = escapeTomlString(join(pkgRoot, 'dist', 'mcp', 'code-intel-server.js'));
-  const traceServerPath = escapeTomlString(join(pkgRoot, 'dist', 'mcp', 'trace-server.js'));
-  const teamServerPath = escapeTomlString(join(pkgRoot, 'dist', 'mcp', 'team-server.js'));
+  const stateServerPath = escapeTomlString(
+    join(pkgRoot, "dist", "mcp", "state-server.js"),
+  );
+  const memoryServerPath = escapeTomlString(
+    join(pkgRoot, "dist", "mcp", "memory-server.js"),
+  );
+  const codeIntelServerPath = escapeTomlString(
+    join(pkgRoot, "dist", "mcp", "code-intel-server.js"),
+  );
+  const traceServerPath = escapeTomlString(
+    join(pkgRoot, "dist", "mcp", "trace-server.js"),
+  );
+  const teamServerPath = escapeTomlString(
+    join(pkgRoot, "dist", "mcp", "team-server.js"),
+  );
 
   return [
-    '',
-    '# ============================================================',
-    '# oh-my-codex (OMX) Configuration',
-    '# Managed by omx setup - manual edits preserved on next setup',
-    '# ============================================================',
-    '',
-    '# OMX State Management MCP Server',
-    '[mcp_servers.omx_state]',
+    "",
+    "# ============================================================",
+    "# oh-my-codex (OMX) Configuration",
+    "# Managed by omx setup - manual edits preserved on next setup",
+    "# ============================================================",
+    "",
+    "# OMX State Management MCP Server",
+    "[mcp_servers.omx_state]",
     'command = "node"',
     `args = ["${stateServerPath}"]`,
-    'enabled = true',
-    'startup_timeout_sec = 5',
-    '',
-    '# OMX Project Memory MCP Server',
-    '[mcp_servers.omx_memory]',
+    "enabled = true",
+    "startup_timeout_sec = 5",
+    "",
+    "# OMX Project Memory MCP Server",
+    "[mcp_servers.omx_memory]",
     'command = "node"',
     `args = ["${memoryServerPath}"]`,
-    'enabled = true',
-    'startup_timeout_sec = 5',
-    '',
-    '# OMX Code Intelligence MCP Server (LSP diagnostics, AST search)',
-    '[mcp_servers.omx_code_intel]',
+    "enabled = true",
+    "startup_timeout_sec = 5",
+    "",
+    "# OMX Code Intelligence MCP Server (LSP diagnostics, AST search)",
+    "[mcp_servers.omx_code_intel]",
     'command = "node"',
     `args = ["${codeIntelServerPath}"]`,
-    'enabled = true',
-    'startup_timeout_sec = 10',
-    '',
-    '# OMX Trace MCP Server (agent flow timeline & statistics)',
-    '[mcp_servers.omx_trace]',
+    "enabled = true",
+    "startup_timeout_sec = 10",
+    "",
+    "# OMX Trace MCP Server (agent flow timeline & statistics)",
+    "[mcp_servers.omx_trace]",
     'command = "node"',
     `args = ["${traceServerPath}"]`,
-    'enabled = true',
-    'startup_timeout_sec = 5',
-    '',
-    '# OMX Team MCP Server (team job lifecycle: start, status, wait, cleanup)',
-    '[mcp_servers.omx_team_run]',
+    "enabled = true",
+    "startup_timeout_sec = 5",
+    "",
+    "# OMX Team MCP Server (team job lifecycle: start, status, wait, cleanup)",
+    "[mcp_servers.omx_team_run]",
     'command = "node"',
     `args = ["${teamServerPath}"]`,
-    'enabled = true',
-    'startup_timeout_sec = 5',
+    "enabled = true",
+    "startup_timeout_sec = 5",
     ...getAgentEntries(agentsConfigDir),
-    '',
-    '# OMX TUI StatusLine (Codex CLI v0.101.0+)',
-    '[tui]',
+    "",
+    "# OMX TUI StatusLine (Codex CLI v0.101.0+)",
+    "[tui]",
     'status_line = ["model-with-reasoning", "git-branch", "context-remaining", "total-input-tokens", "total-output-tokens", "five-hour-limit"]',
-    '',
-    '# ============================================================',
-    '# End oh-my-codex',
-    '',
-  ].join('\n');
+    "",
+    "# ============================================================",
+    "# End oh-my-codex",
+    "",
+  ].join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -401,42 +608,71 @@ function getOmxTablesBlock(pkgRoot: string, agentsConfigDir: string): string {
  *   3. … user sections …
  *   4. OMX [table] sections (mcp_servers, tui)
  */
+export function buildMergedConfig(
+  existingConfig: string,
+  pkgRoot: string,
+  options: MergeOptions = {},
+): string {
+  let existing = existingConfig;
+
+  if (existing.includes("oh-my-codex (OMX) Configuration")) {
+    const stripped = stripExistingOmxBlocks(existing);
+    existing = stripped.cleaned;
+  }
+  if (existing.includes(SHARED_MCP_REGISTRY_MARKER)) {
+    const stripped = stripExistingSharedMcpRegistryBlock(existing);
+    existing = stripped.cleaned;
+  }
+
+  existing = stripOmxTopLevelKeys(existing);
+  if (options.modelOverride) {
+    existing = stripRootLevelKeys(existing, ["model"]);
+  }
+  existing = stripOrphanedOmxSections(existing);
+  existing = upsertFeatureFlags(existing);
+
+  const topLines = getOmxTopLevelLines(
+    pkgRoot,
+    existing,
+    options.modelOverride,
+  );
+  const tablesBlock = getOmxTablesBlock(
+    pkgRoot,
+    options.agentsConfigDir || omxAgentsConfigDir(),
+  );
+  const sharedRegistryBlock = getSharedMcpRegistryBlock(
+    options.sharedMcpServers ?? [],
+    options.sharedMcpRegistrySource,
+    existing,
+  );
+
+  let body = existing.trimEnd();
+  if (sharedRegistryBlock) {
+    body = body ? `${body}\n\n${sharedRegistryBlock}` : sharedRegistryBlock;
+  }
+
+  return topLines.join("\n") + "\n\n" + body + "\n" + tablesBlock;
+}
+
 export async function mergeConfig(
   configPath: string,
   pkgRoot: string,
-  options: MergeOptions = {}
+  options: MergeOptions = {},
 ): Promise<void> {
-  let existing = '';
+  let existing = "";
 
   if (existsSync(configPath)) {
-    existing = await readFile(configPath, 'utf-8');
+    existing = await readFile(configPath, "utf-8");
   }
 
-  // Strip old OMX table-section block
-  if (existing.includes('oh-my-codex (OMX) Configuration')) {
+  if (existing.includes("oh-my-codex (OMX) Configuration")) {
     const stripped = stripExistingOmxBlocks(existing);
-    existing = stripped.cleaned;
     if (options.verbose && stripped.removed > 0) {
-      console.log('  Updating existing OMX config block.');
+      console.log("  Updating existing OMX config block.");
     }
   }
 
-  // Strip any stale OMX top-level keys (from previous runs or wrong positions)
-  existing = stripOmxTopLevelKeys(existing);
-
-  // Strip orphaned OMX table sections that may exist outside the marker block
-  // (legacy configs, or configs where markers were accidentally removed)
-  existing = stripOrphanedOmxSections(existing);
-
-  // Upsert [features] flags
-  existing = upsertFeatureFlags(existing);
-
-  // Build final config:
-  //   top-level keys → existing content (with [features]) → OMX tables block
-  const topLines = getOmxTopLevelLines(pkgRoot);
-  const tablesBlock = getOmxTablesBlock(pkgRoot, options.agentsConfigDir || omxAgentsConfigDir());
-
-  const finalConfig = topLines.join('\n') + '\n\n' + existing.trimEnd() + '\n' + tablesBlock;
+  const finalConfig = buildMergedConfig(existing, pkgRoot, options);
 
   await writeFile(configPath, finalConfig);
   if (options.verbose) {

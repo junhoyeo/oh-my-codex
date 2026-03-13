@@ -83,7 +83,7 @@
 | code-review | DONE | ~/.agents/skills/code-review/SKILL.md |
 | security-review | DONE | ~/.agents/skills/security-review/SKILL.md |
 | tdd | DONE | ~/.agents/skills/tdd/SKILL.md |
-| ~~deepinit~~ | REMOVED (v0.5.0) | — |
+| deepinit | DONE (lightweight CLI successor) | `omx agents-init [path]` (`omx deepinit [path]` alias) |
 | deepsearch | DONE | ~/.agents/skills/deepsearch/SKILL.md |
 | analyze | DONE | ~/.agents/skills/analyze/SKILL.md |
 | build-fix | DONE | ~/.agents/skills/build-fix/SKILL.md |
@@ -101,8 +101,11 @@
 | ralph-init | DONE | ~/.agents/skills/ralph-init/SKILL.md |
 | ~~release~~ | REMOVED (v0.5.0) | — |
 | omx-setup | DONE | ~/.agents/skills/omx-setup/SKILL.md |
-| configure-telegram | DONE | ~/.agents/skills/configure-telegram/SKILL.md |
-| configure-discord | DONE | ~/.agents/skills/configure-discord/SKILL.md |
+| configure-notifications | DONE | ~/.agents/skills/configure-notifications/SKILL.md |
+| ~~configure-telegram~~ | MERGED -> configure-notifications | — |
+| ~~configure-discord~~ | MERGED -> configure-notifications | — |
+| ~~configure-slack~~ | MERGED -> configure-notifications | — |
+| ~~configure-openclaw~~ | MERGED -> configure-notifications | — |
 | ~~writer-memory~~ | REMOVED (v0.5.0) | — |
 | ~~project-session-manager~~ | REMOVED (v0.5.0) | — |
 | ~~psm~~ | REMOVED (v0.5.0) | — |

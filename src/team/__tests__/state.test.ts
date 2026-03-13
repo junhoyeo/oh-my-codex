@@ -1,4 +1,4 @@
-import { describe, it } from 'node:test';
+import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm, writeFile, readFile, mkdir, utimes } from 'fs/promises';
 import { join } from 'path';
@@ -20,6 +20,7 @@ import {
   readTeamManifestV2,
   transitionTaskStatus,
   releaseTaskClaim,
+  reclaimExpiredTaskClaim,
   sendDirectMessage,
   broadcastMessage,
   markMessageDelivered,
@@ -32,6 +33,8 @@ import {
   updateTask,
   updateWorkerHeartbeat,
   writeAtomic,
+  setWriteAtomicRenameForTests,
+  resetWriteAtomicRenameForTests,
   writeWorkerInbox,
   enqueueDispatchRequest,
   listDispatchRequests,
@@ -41,6 +44,10 @@ import {
   readDispatchRequest,
   resolveDispatchLockTimeoutMs,
 } from '../state.js';
+
+afterEach(() => {
+  resetWriteAtomicRenameForTests();
+});
 
 describe('team state', () => {
   it('initTeamState creates correct directory structure and config.json', async () => {
@@ -70,6 +77,7 @@ describe('team state', () => {
       assert.equal(diskCfg.worker_count, 2);
       assert.equal(diskCfg.max_workers, DEFAULT_MAX_WORKERS);
       assert.equal(diskCfg.tmux_session, 'omx-team-team-1');
+      assert.equal(diskCfg.lifecycle_profile, 'default');
       assert.equal(diskCfg.leader_pane_id, null);
       assert.equal(diskCfg.hud_pane_id, null);
       assert.equal(diskCfg.resize_hook_name, null);
@@ -77,6 +85,31 @@ describe('team state', () => {
       assert.equal(typeof diskCfg.next_task_id, 'number');
       assert.ok(Array.isArray(diskCfg.workers));
       assert.equal(diskCfg.workers.length, 2);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('initTeamState persists linked_ralph lifecycle profile when requested', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-lifecycle-profile-'));
+    try {
+      const cfg = await initTeamState(
+        'team-linked',
+        'do stuff',
+        'executor',
+        1,
+        cwd,
+        DEFAULT_MAX_WORKERS,
+        process.env,
+        {},
+        'linked_ralph',
+      );
+
+      assert.equal(cfg.lifecycle_profile, 'linked_ralph');
+      const readCfg = await readTeamConfig('team-linked', cwd);
+      const manifest = await readTeamManifestV2('team-linked', cwd);
+      assert.equal(readCfg?.lifecycle_profile, 'linked_ralph');
+      assert.equal(manifest?.lifecycle_profile, 'linked_ralph');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -95,6 +128,7 @@ describe('team state', () => {
       assert.ok(m1);
       const onDisk1 = await readTeamManifestV2('team-mig', cwd);
       assert.ok(onDisk1);
+      assert.equal(onDisk1?.lifecycle_profile, 'default');
 
       const m2 = await migrateV1ToV2('team-mig', cwd);
       assert.deepEqual(m2, onDisk1);
@@ -103,7 +137,7 @@ describe('team state', () => {
     }
   });
 
-  it('normalizes legacy manifest policy with dispatch defaults and timeout bounds', async () => {
+  it('normalizes legacy manifest policy with dispatch defaults, timeout bounds, and governance split', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-manifest-policy-'));
     try {
       await initTeamState('team-policy', 't', 'executor', 1, cwd);
@@ -112,12 +146,40 @@ describe('team state', () => {
       const policy = (manifest.policy ?? {}) as Record<string, unknown>;
       delete policy.dispatch_mode;
       policy.dispatch_ack_timeout_ms = 999_999;
+      policy.delegation_only = true;
+      policy.nested_teams_allowed = true;
+      policy.cleanup_requires_all_workers_inactive = false;
       manifest.policy = policy;
+      delete manifest.governance;
       await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
 
       const loaded = await readTeamManifestV2('team-policy', cwd);
       assert.equal(loaded?.policy.dispatch_mode, 'hook_preferred_with_fallback');
       assert.equal(loaded?.policy.dispatch_ack_timeout_ms, 10_000);
+      assert.equal(loaded?.governance.delegation_only, true);
+      assert.equal(loaded?.governance.nested_teams_allowed, true);
+      assert.equal(loaded?.governance.cleanup_requires_all_workers_inactive, false);
+      assert.equal('delegation_only' in (loaded?.policy ?? {}), false);
+      assert.equal('nested_teams_allowed' in (loaded?.policy ?? {}), false);
+      assert.equal('cleanup_requires_all_workers_inactive' in (loaded?.policy ?? {}), false);
+
+      const freshCwd = await mkdtemp(join(tmpdir(), 'omx-team-manifest-policy-default-'));
+      try {
+        await initTeamState('team-policy-default', 't', 'executor', 1, freshCwd);
+        const fresh = await readTeamManifestV2('team-policy-default', freshCwd);
+        assert.equal(fresh?.policy.dispatch_ack_timeout_ms, 2_000);
+        assert.equal(fresh?.governance.cleanup_requires_all_workers_inactive, true);
+
+        const freshManifestPath = join(freshCwd, '.omx', 'state', 'team', 'team-policy-default', 'manifest.v2.json');
+        const persisted = JSON.parse(await readFile(freshManifestPath, 'utf8')) as {
+          policy?: Record<string, unknown>;
+          governance?: Record<string, unknown>;
+        };
+        assert.equal('delegation_only' in (persisted.policy ?? {}), false);
+        assert.equal(persisted.governance?.delegation_only, false);
+      } finally {
+        await rm(freshCwd, { recursive: true, force: true });
+      }
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -240,6 +302,7 @@ describe('team state', () => {
       assert.equal(manifest?.leader_cwd, '/tmp/leader');
       assert.equal(manifest?.team_state_root, '/tmp/leader/.omx/state');
       assert.equal(manifest?.workspace_mode, 'worktree');
+      assert.equal(manifest?.lifecycle_profile, 'default');
       assert.equal(manifest?.leader_pane_id, null);
       assert.equal(manifest?.hud_pane_id, null);
       assert.equal(manifest?.resize_hook_name, null);
@@ -575,6 +638,57 @@ describe('team state', () => {
     }
   });
 
+  it('transitionTaskStatus persists terminal result and error payloads', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-transition-payload-'));
+    try {
+      await initTeamState('team-transition-payload', 't', 'executor', 1, cwd);
+
+      const completedTask = await createTask('team-transition-payload', { subject: 'done', description: 'd', status: 'pending' }, cwd);
+      const completedClaim = await claimTask('team-transition-payload', completedTask.id, 'worker-1', completedTask.version ?? 1, cwd);
+      assert.equal(completedClaim.ok, true);
+      if (!completedClaim.ok) return;
+
+      const completedResult = 'Verification:\nPASS - bootstrap state exists';
+      const completedTransition = await transitionTaskStatus(
+        'team-transition-payload',
+        completedTask.id,
+        'in_progress',
+        'completed',
+        completedClaim.claimToken,
+        cwd,
+        { result: completedResult },
+      );
+      assert.equal(completedTransition.ok, true);
+
+      const completedReread = await readTask('team-transition-payload', completedTask.id, cwd);
+      assert.equal(completedReread?.result, completedResult);
+      assert.equal(completedReread?.error, undefined);
+
+      const failedTask = await createTask('team-transition-payload', { subject: 'fail', description: 'd', status: 'pending' }, cwd);
+      const failedClaim = await claimTask('team-transition-payload', failedTask.id, 'worker-1', failedTask.version ?? 1, cwd);
+      assert.equal(failedClaim.ok, true);
+      if (!failedClaim.ok) return;
+
+      const failedError = 'Verification failed: missing bootstrap evidence';
+      const failedTransition = await transitionTaskStatus(
+        'team-transition-payload',
+        failedTask.id,
+        'in_progress',
+        'failed',
+        failedClaim.claimToken,
+        cwd,
+        { error: failedError },
+      );
+      assert.equal(failedTransition.ok, true);
+
+      const failedReread = await readTask('team-transition-payload', failedTask.id, cwd);
+      assert.equal(failedReread?.error, failedError);
+      assert.equal(failedReread?.result, undefined);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('transitionTaskStatus appends task_failed event (not worker_stopped) when task fails', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-failed-'));
     try {
@@ -618,7 +732,7 @@ describe('team state', () => {
     }
   });
 
-  it('releaseTaskClaim can recover with owner match when claim token changed', async () => {
+  it('releaseTaskClaim returns claim_conflict when claim token changed, even for the owner', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-release-owner-'));
     try {
       await initTeamState('team-release-owner', 't', 'executor', 1, cwd);
@@ -634,12 +748,8 @@ describe('team state', () => {
       await writeFile(taskPath, JSON.stringify(current, null, 2));
 
       const released = await releaseTaskClaim('team-release-owner', t.id, claim.claimToken, 'worker-1', cwd);
-      assert.equal(released.ok, true);
-
-      const reread = await readTask('team-release-owner', t.id, cwd);
-      assert.equal(reread?.status, 'pending');
-      assert.equal(reread?.owner, undefined);
-      assert.equal(reread?.claim, undefined);
+      assert.equal(released.ok, false);
+      assert.equal(released.ok ? 'x' : released.error, 'claim_conflict');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -721,7 +831,7 @@ describe('team state', () => {
     }
   });
 
-  it('releaseTaskClaim returns claim_conflict when lease has expired and caller is not the owner', async () => {
+  it('releaseTaskClaim returns lease_expired when lease has expired and caller is not the owner', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-lease-release-'));
     try {
       await initTeamState('team-lease-release', 't', 'executor', 1, cwd);
@@ -739,13 +849,13 @@ describe('team state', () => {
       // Different worker tries to release with the expired token.
       const result = await releaseTaskClaim('team-lease-release', t.id, claim.claimToken, 'worker-2', cwd);
       assert.equal(result.ok, false);
-      assert.equal(result.ok ? 'x' : result.error, 'claim_conflict');
+      assert.equal(result.ok ? 'x' : result.error, 'lease_expired');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
   });
 
-  it('releaseTaskClaim succeeds via owner match when lease has expired', async () => {
+  it('releaseTaskClaim returns lease_expired when lease has expired, even for the owner', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-lease-release-owner-'));
     try {
       await initTeamState('team-lease-release-owner', 't', 'executor', 1, cwd);
@@ -754,19 +864,45 @@ describe('team state', () => {
       assert.equal(claim.ok, true);
       if (!claim.ok) return;
 
-      // Backdate leased_until so tokenMatches fails, but ownerMatches still holds.
+      // Backdate leased_until so the claim token is no longer valid.
       const taskPath = join(cwd, '.omx', 'state', 'team', 'team-lease-release-owner', 'tasks', `task-${t.id}.json`);
       const current = JSON.parse(await readFile(taskPath, 'utf-8')) as any;
       current.claim.leased_until = new Date(Date.now() - 1000).toISOString();
       await writeFile(taskPath, JSON.stringify(current, null, 2));
 
-      // Same worker releases — should succeed via owner match.
+      // Same worker releases — should now fail because owner-only bypass is removed.
       const result = await releaseTaskClaim('team-lease-release-owner', t.id, claim.claimToken, 'worker-1', cwd);
-      assert.equal(result.ok, true);
+      assert.equal(result.ok, false);
+      assert.equal(result.ok ? 'x' : result.error, 'lease_expired');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
 
-      const reread = await readTask('team-lease-release-owner', t.id, cwd);
-      assert.equal(reread?.status, 'pending');
-      assert.equal(reread?.claim, undefined);
+
+  it('reclaimExpiredTaskClaim reopens an expired in-progress task so another worker can claim it', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-reclaim-expired-'));
+    try {
+      await initTeamState('team-reclaim-expired', 't', 'executor', 2, cwd);
+      const t = await createTask('team-reclaim-expired', { subject: 'a', description: 'd', status: 'pending' }, cwd);
+      const claim = await claimTask('team-reclaim-expired', t.id, 'worker-1', t.version ?? 1, cwd);
+      assert.equal(claim.ok, true);
+      if (!claim.ok) return;
+
+      const taskPath = join(cwd, '.omx', 'state', 'team', 'team-reclaim-expired', 'tasks', `task-${t.id}.json`);
+      const current = JSON.parse(await readFile(taskPath, 'utf-8')) as any;
+      current.claim.leased_until = new Date(Date.now() - 1000).toISOString();
+      await writeFile(taskPath, JSON.stringify(current, null, 2));
+
+      const reclaimed = await reclaimExpiredTaskClaim('team-reclaim-expired', t.id, cwd);
+      assert.equal(reclaimed.ok, true);
+      if (!reclaimed.ok) return;
+      assert.equal(reclaimed.reclaimed, true);
+      assert.equal(reclaimed.task.status, 'pending');
+      assert.equal(reclaimed.task.claim, undefined);
+
+      const secondClaim = await claimTask('team-reclaim-expired', t.id, 'worker-2', reclaimed.task.version ?? null, cwd);
+      assert.equal(secondClaim.ok, true);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -1190,6 +1326,47 @@ describe('team state', () => {
     }
   });
 
+  it('writeAtomic does not swallow ENOENT when destination content differs', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-state-'));
+    try {
+      const p = join(cwd, 'atomic-fallback.txt');
+      await writeFile(p, 'old', 'utf8');
+
+      setWriteAtomicRenameForTests(async () => {
+        const err = new Error('missing temp') as NodeJS.ErrnoException;
+        err.code = 'ENOENT';
+        throw err;
+      });
+
+      await assert.rejects(() => writeAtomic(p, 'new'), (error: unknown) => {
+        const err = error as NodeJS.ErrnoException;
+        return err.code === 'ENOENT';
+      });
+      assert.equal(readFileSync(p, 'utf8'), 'old');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('writeAtomic keeps ENOENT fallback when destination already has expected content', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-state-'));
+    try {
+      const p = join(cwd, 'atomic-fallback-safe.txt');
+      await writeFile(p, 'same-content', 'utf8');
+
+      setWriteAtomicRenameForTests(async () => {
+        const err = new Error('missing temp') as NodeJS.ErrnoException;
+        err.code = 'ENOENT';
+        throw err;
+      });
+
+      await writeAtomic(p, 'same-content');
+      assert.equal(readFileSync(p, 'utf8'), 'same-content');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('readWorkerStatus returns {state:\'unknown\'} on missing file', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-state-'));
     try {
@@ -1365,6 +1542,7 @@ describe('team state', () => {
       assert.ok(config);
       assert.equal(manifest?.policy.display_mode, 'split_pane');
       assert.equal(manifest?.policy.worker_launch_mode, 'prompt');
+      assert.equal(manifest?.governance.cleanup_requires_all_workers_inactive, true);
       assert.equal(config?.worker_launch_mode, 'prompt');
       assert.equal(manifest?.permissions_snapshot.approval_mode, 'on-request');
       assert.equal(manifest?.permissions_snapshot.sandbox_mode, 'workspace-write');

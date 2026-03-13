@@ -11,7 +11,7 @@
  */
 
 import { join, resolve } from 'path';
-import { mkdir } from 'fs/promises';
+import { mkdir, rm } from 'fs/promises';
 import {
   sanitizeTeamName,
   isTmuxAvailable,
@@ -24,7 +24,7 @@ import {
   buildWorkerStartupCommand,
   resolveTeamWorkerCliPlan,
 } from './tmux-session.js';
-import { spawnSync } from 'child_process';
+import { execFileSync, spawnSync } from 'child_process';
 import {
   teamReadConfig as readTeamConfig,
   teamSaveConfig as saveTeamConfig,
@@ -35,6 +35,8 @@ import {
   teamWriteWorkerStatus as writeWorkerStatus,
   teamWithScalingLock as withScalingLock,
   teamAppendEvent as appendTeamEvent,
+  teamCreateTask as createStateTask,
+  teamListTasks as listTasks,
   teamMarkDispatchRequestNotified as markDispatchRequestNotified,
   teamReadDispatchRequest as readDispatchRequest,
   teamTransitionDispatchRequest as transitionDispatchRequest,
@@ -49,22 +51,23 @@ import {
 import {
   generateInitialInbox,
   generateTriggerMessage,
+  writeWorkerRoleInstructionsFile,
 } from './worker-bootstrap.js';
 import { loadRolePrompt } from './role-router.js';
 import { codexPromptsDir } from '../utils/paths.js';
 import {
   resolveTeamWorkerLaunchArgs,
   isLowComplexityAgentType,
-  TEAM_LOW_COMPLEXITY_DEFAULT_MODEL,
+  resolveAgentReasoningEffort,
+  resolveTeamLowComplexityDefaultModel,
+  type TeamReasoningEffort,
 } from './model-contract.js';
-// Inlined to avoid circular dependency with runtime.ts
-function resolveCanonicalTeamStateRoot(leaderCwd: string): string {
-  return resolve(join(leaderCwd, '.omx', 'state'));
-}
+import { resolveCanonicalTeamStateRoot } from './state-root.js';
 
 // ── Environment gate ──────────────────────────────────────────────────────────
 
 const OMX_TEAM_SCALING_ENABLED_ENV = 'OMX_TEAM_SCALING_ENABLED';
+const WORKTREE_TRIGGER_STATE_ROOT = '$OMX_TEAM_STATE_ROOT';
 
 export function isScalingEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   const raw = env[OMX_TEAM_SCALING_ENABLED_ENV];
@@ -101,12 +104,16 @@ export interface ScaleError {
   error: string;
 }
 
+function resolveInstructionStateRoot(worktreePath?: string | null): string | undefined {
+  return worktreePath ? WORKTREE_TRIGGER_STATE_ROOT : undefined;
+}
+
 async function notifyWorkerPaneOutcome(
   sessionName: string,
   workerIndex: number,
   message: string,
   paneId?: string,
-  workerCli?: 'codex' | 'claude',
+  workerCli?: 'codex' | 'claude' | 'gemini',
 ): Promise<DispatchOutcome> {
   try {
     await sendToWorker(sessionName, workerIndex, message, paneId, workerCli);
@@ -174,11 +181,58 @@ export async function scaleUp(
 
     // Resolve the monotonic worker index counter
     let nextIndex = config.next_worker_index ?? (currentCount + 1);
+    const initialNextIndex = nextIndex;
     const addedWorkers: WorkerInfo[] = [];
+    const createdTaskIds: string[] = [];
 
-    // Resolve worker launch args
-    const workerLaunchArgs = resolveWorkerLaunchArgsForScaling(env, agentType);
-    const workerCliPlan = resolveTeamWorkerCliPlan(count, workerLaunchArgs, env);
+    const rollbackScaleUp = async (error: string, paneId?: string): Promise<ScaleError> => {
+      for (const w of addedWorkers) {
+        const idx = config.workers.findIndex((worker) => worker.name === w.name);
+        if (idx >= 0) {
+          config.workers.splice(idx, 1);
+        }
+        try {
+          if (w.pane_id) {
+            execFileSync('tmux', ['kill-pane', '-t', w.pane_id], { stdio: 'pipe' });
+          }
+        } catch {}
+      }
+
+      if (paneId) {
+        try {
+          execFileSync('tmux', ['kill-pane', '-t', paneId], { stdio: 'pipe' });
+        } catch {}
+      }
+
+      for (const taskId of createdTaskIds) {
+        await rm(join(leaderCwd, '.omx', 'state', 'team', sanitized, 'tasks', `task-${taskId}.json`), { force: true }).catch(() => {});
+      }
+
+      config.worker_count = config.workers.length;
+      config.next_worker_index = initialNextIndex;
+      await saveTeamConfig(config, leaderCwd);
+
+      return { ok: false, error };
+    };
+
+    // Persist incoming tasks first so scaling resolves worker roles and inboxes from
+    // canonical task state (stable task ids, owner, role), matching startTeam().
+    for (const task of tasks) {
+      const createdTask = await createStateTask(sanitized, {
+        subject: task.subject,
+        description: task.description,
+        status: 'pending',
+        owner: task.owner,
+        blocked_by: task.blocked_by,
+        role: task.role,
+      }, leaderCwd);
+      createdTaskIds.push(createdTask.id);
+    }
+    const persistedTasks = await listTasks(sanitized, leaderCwd);
+
+    // Resolve shared worker launch args for CLI selection.
+    const sharedWorkerLaunchArgs = resolveWorkerLaunchArgsForScaling(env, agentType);
+    const workerCliPlan = resolveTeamWorkerCliPlan(count, sharedWorkerLaunchArgs, env);
 
     for (let i = 0; i < count; i++) {
       const workerIndex = nextIndex;
@@ -189,11 +243,30 @@ export async function scaleUp(
       const workerDirPath = join(leaderCwd, '.omx', 'state', 'team', sanitized, 'workers', workerName);
       await mkdir(workerDirPath, { recursive: true });
 
+      // Resolve per-worker role from assigned task roles before launch so reasoning effort can vary by teammate.
+      const workerTaskRoles = persistedTasks.filter(t => t.owner === workerName).map(t => t.role).filter(Boolean) as string[];
+      const uniqueTaskRoles = new Set(workerTaskRoles);
+      const workerRole = workerTaskRoles.length > 0 && uniqueTaskRoles.size === 1
+        ? workerTaskRoles[0]
+        : agentType;
+      if (uniqueTaskRoles.size > 1) {
+        console.log(`[omx:scaling] ${workerName}: mixed task roles [${[...uniqueTaskRoles].join(', ')}], falling back to ${agentType}`);
+      }
+
       // Build startup command and create tmux pane
+      const rolePromptContent = await loadRolePrompt(workerRole, join(leaderCwd, '.codex', 'prompts'))
+        ?? await loadRolePrompt(workerRole, codexPromptsDir());
+      const teamInstructionsPath = join(leaderCwd, '.omx', 'state', 'team', sanitized, 'worker-agents.md');
+      const instructionsFilePath = rolePromptContent
+        ? await writeWorkerRoleInstructionsFile(sanitized, workerName, leaderCwd, teamInstructionsPath, workerRole, rolePromptContent)
+        : teamInstructionsPath;
       const extraEnv: Record<string, string> = {
         OMX_TEAM_STATE_ROOT: teamStateRoot,
         OMX_TEAM_LEADER_CWD: leaderCwd,
+        OMX_MODEL_INSTRUCTIONS_FILE: instructionsFilePath,
       };
+      const preferredReasoning = resolveAgentReasoningEffort(workerRole) ?? resolveAgentReasoningEffort(agentType);
+      const workerLaunchArgs = resolveWorkerLaunchArgsForScaling(env, agentType, preferredReasoning);
       const cmd = buildWorkerStartupCommand(
         sanitized,
         workerIndex,
@@ -216,12 +289,12 @@ export async function scaleUp(
       ], { encoding: 'utf-8' });
 
       if (result.status !== 0) {
-        return { ok: false, error: `Failed to create tmux pane for ${workerName}: ${(result.stderr || '').trim()}` };
+        return await rollbackScaleUp(`Failed to create tmux pane for ${workerName}: ${(result.stderr || '').trim()}`);
       }
 
       const paneId = (result.stdout || '').trim().split('\n')[0]?.trim();
       if (!paneId || !paneId.startsWith('%')) {
-        return { ok: false, error: `Failed to capture pane ID for ${workerName}` };
+        return await rollbackScaleUp(`Failed to capture pane ID for ${workerName}`);
       }
 
       // Intentionally avoid forcing `select-layout tiled` here.
@@ -229,16 +302,6 @@ export async function scaleUp(
 
       // Get PID
       const panePid = getWorkerPanePid(sessionName, workerIndex, paneId);
-
-      // Resolve per-worker role from assigned task roles
-      const workerTaskRoles = tasks.filter(t => t.owner === workerName).map(t => t.role).filter(Boolean) as string[];
-      const uniqueTaskRoles = new Set(workerTaskRoles);
-      const workerRole = workerTaskRoles.length > 0 && uniqueTaskRoles.size === 1
-        ? workerTaskRoles[0]
-        : agentType;
-      if (uniqueTaskRoles.size > 1) {
-        console.log(`[omx:scaling] ${workerName}: mixed task roles [${[...uniqueTaskRoles].join(', ')}], falling back to ${agentType}`);
-      }
 
       const workerInfo: WorkerInfo = {
         name: workerName,
@@ -265,29 +328,20 @@ export async function scaleUp(
       }
 
       // Get assigned tasks for this worker
-      const workerTasks = tasks.filter(t => t.owner === workerName);
+      const workerTasks = persistedTasks.filter(t => t.owner === workerName);
 
-      // Load role-specific prompt content if role differs from default
-      const rolePromptContent = workerRole !== agentType
-        ? await loadRolePrompt(workerRole, codexPromptsDir())
-        : null;
-
-      const inbox = generateInitialInbox(workerName, sanitized, agentType, workerTasks.map((t, idx) => ({
-        id: String(idx + 1),
-        subject: t.subject,
-        description: t.description,
-        status: 'pending' as const,
-        blocked_by: t.blocked_by,
-        role: t.role,
-        created_at: new Date().toISOString(),
-      })), {
+      const inbox = generateInitialInbox(workerName, sanitized, agentType, workerTasks, {
         teamStateRoot,
         leaderCwd,
         workerRole,
         rolePromptContent: rolePromptContent ?? undefined,
       });
 
-      const trigger = generateTriggerMessage(workerName, sanitized);
+      const trigger = generateTriggerMessage(
+        workerName,
+        sanitized,
+        resolveInstructionStateRoot(workerInfo.worktree_path),
+      );
       const queued = await queueInboxInstruction({
         teamName: sanitized,
         workerName,
@@ -401,17 +455,15 @@ export async function scaleUp(
         }
       }
       if (!outcome.ok) {
-        return { ok: false, error: `scale_up_dispatch_failed:${workerName}:${outcome.reason}` };
+        return await rollbackScaleUp(`scale_up_dispatch_failed:${workerName}:${outcome.reason}`, paneId);
       }
 
       addedWorkers.push(workerInfo);
       config.workers.push(workerInfo);
+      config.worker_count = config.workers.length;
+      config.next_worker_index = nextIndex;
+      await saveTeamConfig(config, leaderCwd);
     }
-
-    // Update config with new workers and next_worker_index
-    config.worker_count = config.workers.length;
-    config.next_worker_index = nextIndex;
-    await saveTeamConfig(config, leaderCwd);
 
     await appendTeamEvent(sanitized, {
       type: 'team_leader_nudge',
@@ -588,15 +640,20 @@ function resolveWorkerReadyTimeoutMs(env: NodeJS.ProcessEnv): number {
   return 45_000;
 }
 
-function resolveWorkerLaunchArgsForScaling(env: NodeJS.ProcessEnv, agentType: string): string[] {
+function resolveWorkerLaunchArgsForScaling(
+  env: NodeJS.ProcessEnv,
+  agentType: string,
+  preferredReasoning?: TeamReasoningEffort,
+): string[] {
   const inheritedArgs: string[] = [];
   const fallbackModel = isLowComplexityAgentType(agentType)
-    ? TEAM_LOW_COMPLEXITY_DEFAULT_MODEL
+    ? resolveTeamLowComplexityDefaultModel(env.CODEX_HOME)
     : undefined;
 
   return resolveTeamWorkerLaunchArgs({
     existingRaw: env.OMX_TEAM_WORKER_LAUNCH_ARGS,
     inheritedArgs,
     fallbackModel,
+    preferredReasoning,
   });
 }

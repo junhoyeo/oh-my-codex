@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { setup } from '../setup.js';
@@ -20,6 +21,19 @@ function setMockTty(value: boolean): () => void {
   };
 }
 
+function setMockHome(home: string): () => void {
+  const previousHome = process.env.HOME;
+  const previousCodexHome = process.env.CODEX_HOME;
+  process.env.HOME = home;
+  process.env.CODEX_HOME = join(home, '.codex');
+  return () => {
+    if (typeof previousHome === 'string') process.env.HOME = previousHome;
+    else delete process.env.HOME;
+    if (typeof previousCodexHome === 'string') process.env.CODEX_HOME = previousCodexHome;
+    else delete process.env.CODEX_HOME;
+  };
+}
+
 async function runSetupWithCapturedLogs(
   cwd: string,
   options: Parameters<typeof setup>[0]
@@ -32,7 +46,10 @@ async function runSetupWithCapturedLogs(
     logs.push(args.map((arg) => String(arg)).join(' '));
   };
   try {
-    await setup(options);
+    await setup({
+      modelUpgradePrompt: async () => false,
+      ...options,
+    });
     return logs.join('\n');
   } finally {
     console.log = originalLog;
@@ -54,13 +71,43 @@ async function readCurrentLinuxStartTicks(): Promise<number | undefined> {
   }
 }
 
-describe('omx setup AGENTS overwrite prompt behavior', () => {
-  it('overwrites existing AGENTS.md when prompt accepts in TTY', async () => {
+describe('omx setup AGENTS refresh behavior', () => {
+  it('creates user-scope AGENTS.md and leaves project AGENTS.md untouched', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-setup-agents-'));
     const restoreTty = setMockTty(true);
+    const home = join(wd, 'home');
+    const restoreHome = setMockHome(home);
+    const existing = '# project-owned agents file\n';
     try {
       await mkdir(join(wd, '.omx', 'state'), { recursive: true });
-      await writeFile(join(wd, 'AGENTS.md'), '# old agents file\n');
+      await writeFile(join(wd, 'AGENTS.md'), existing);
+
+      const output = await runSetupWithCapturedLogs(wd, {
+        scope: 'user',
+      });
+
+      assert.match(output, /Generated AGENTS\.md in .*home\/\.codex\./);
+      assert.match(output, /User scope leaves project AGENTS\.md unchanged\./);
+      assert.match(output, /agents_md: updated=1, unchanged=0, backed_up=0, skipped=0, removed=0/);
+      assert.equal(await readFile(join(wd, 'AGENTS.md'), 'utf-8'), existing);
+      assert.equal(existsSync(join(home, '.codex', 'AGENTS.md')), true);
+      assert.equal(existsSync(join(wd, '.omx', 'backups', 'setup')), false);
+    } finally {
+      restoreHome();
+      restoreTty();
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('overwrites existing AGENTS.md in TTY after confirmation and creates a backup first', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-setup-agents-'));
+    const restoreTty = setMockTty(true);
+    const home = join(wd, 'home');
+    const restoreHome = setMockHome(home);
+    const existing = '# old agents file\n';
+    try {
+      await mkdir(join(wd, '.omx', 'state'), { recursive: true });
+      await writeFile(join(wd, 'AGENTS.md'), existing);
 
       const output = await runSetupWithCapturedLogs(wd, {
         scope: 'project',
@@ -69,18 +116,29 @@ describe('omx setup AGENTS overwrite prompt behavior', () => {
 
       const agentsContent = await readFile(join(wd, 'AGENTS.md'), 'utf-8');
       assert.match(output, /Generated AGENTS\.md in project root\./);
+      assert.match(output, /agents_md: updated=1, unchanged=0, backed_up=1, skipped=0, removed=0/);
       assert.match(agentsContent, /# oh-my-codex - Intelligent Multi-Agent Orchestration/);
       assert.doesNotMatch(agentsContent, /# old agents file/);
+
+      const backupsRoot = join(wd, '.omx', 'backups', 'setup');
+      assert.equal(existsSync(backupsRoot), true);
+      const timestamps = await readdir(backupsRoot);
+      assert.equal(timestamps.length, 1);
+      const backupContent = await readFile(join(backupsRoot, timestamps[0], 'AGENTS.md'), 'utf-8');
+      assert.equal(backupContent, existing);
     } finally {
+      restoreHome();
       restoreTty();
       await rm(wd, { recursive: true, force: true });
     }
   });
 
-  it('preserves existing AGENTS.md when prompt declines in TTY', async () => {
+  it('skips overwrite when confirmation is declined', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-setup-agents-'));
     const restoreTty = setMockTty(true);
-    const existing = '# keep me\n';
+    const home = join(wd, 'home');
+    const restoreHome = setMockHome(home);
+    const existing = '# keep this agents file\n';
     try {
       await mkdir(join(wd, '.omx', 'state'), { recursive: true });
       await writeFile(join(wd, 'AGENTS.md'), existing);
@@ -90,17 +148,22 @@ describe('omx setup AGENTS overwrite prompt behavior', () => {
         agentsOverwritePrompt: async () => false,
       });
 
-      assert.match(output, /AGENTS\.md already exists \(use --force to overwrite\)\./);
+      assert.match(output, /Skipped AGENTS\.md overwrite/);
+      assert.match(output, /agents_md: updated=0, unchanged=0, backed_up=0, skipped=1, removed=0/);
       assert.equal(await readFile(join(wd, 'AGENTS.md'), 'utf-8'), existing);
+      assert.equal(existsSync(join(wd, '.omx', 'backups', 'setup')), false);
     } finally {
+      restoreHome();
       restoreTty();
       await rm(wd, { recursive: true, force: true });
     }
   });
 
-  it('skips overwrite during active session even when prompt accepts in TTY', async () => {
+  it('skips overwrite during active session under refresh-first defaults', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-setup-agents-'));
     const restoreTty = setMockTty(true);
+    const home = join(wd, 'home');
+    const restoreHome = setMockHome(home);
     const existing = '# active session file\n';
     try {
       const pidStartTicks = await readCurrentLinuxStartTicks();
@@ -119,14 +182,16 @@ describe('omx setup AGENTS overwrite prompt behavior', () => {
 
       const output = await runSetupWithCapturedLogs(wd, {
         scope: 'project',
-        agentsOverwritePrompt: async () => true,
       });
 
       assert.match(output, /WARNING: Active omx session detected/);
       assert.match(output, /Skipping AGENTS\.md overwrite to avoid corrupting runtime overlay\./);
-      assert.match(output, /re-run setup and approve overwrite \(or use --force\)\./);
+      assert.match(output, /Stop the active session first, then re-run setup\./);
+      assert.match(output, /agents_md: updated=0, unchanged=0, backed_up=0, skipped=1, removed=0/);
       assert.equal(await readFile(join(wd, 'AGENTS.md'), 'utf-8'), existing);
+      assert.equal(existsSync(join(wd, '.omx', 'backups', 'setup')), false);
     } finally {
+      restoreHome();
       restoreTty();
       await rm(wd, { recursive: true, force: true });
     }

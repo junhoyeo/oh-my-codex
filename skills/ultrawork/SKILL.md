@@ -37,9 +37,9 @@ Sequential task execution wastes time when tasks are independent. Ultrawork enab
 1. **Read agent reference**: Load `docs/shared/agent-tiers.md` for tier selection
 2. **Classify tasks by independence**: Identify which tasks can run in parallel vs which have dependencies
 3. **Route to correct tiers**:
-   - Simple lookups/definitions: LOW tier (Haiku)
-   - Standard implementation: MEDIUM tier (Sonnet)
-   - Complex analysis/refactoring: HIGH tier (Opus)
+   - Simple lookups/definitions: LOW tier
+   - Standard implementation: STANDARD tier
+   - Complex analysis/refactoring: THOROUGH tier
 4. **Fire independent tasks simultaneously**: Launch all parallel-safe tasks at once
 5. **Run dependent tasks sequentially**: Wait for prerequisites before launching dependent work
 6. **Background long operations**: Builds, installs, and test suites use `run_in_background: true`
@@ -50,9 +50,9 @@ Sequential task execution wastes time when tasks are independent. Ultrawork enab
 </Steps>
 
 <Tool_Usage>
-- Use `spawn_sub_agent(subagent_type="oh-my-codex:executor-low", model="haiku", ...)` for simple changes
-- Use `spawn_sub_agent(subagent_type="oh-my-codex:executor", model="sonnet", ...)` for standard work
-- Use `spawn_sub_agent(subagent_type="oh-my-codex:executor-high", model="opus", ...)` for complex work
+- Use LOW-tier delegation for simple changes
+- Use STANDARD-tier delegation for standard work
+- Use THOROUGH-tier delegation for complex work
 - Use `run_in_background: true` for package installs, builds, and test suites
 - Use foreground execution for quick status checks and file operations
 </Tool_Usage>
@@ -74,9 +74,9 @@ Use `omx_state` MCP tools for ultrawork lifecycle state.
 <Good>
 Three independent tasks fired simultaneously:
 ```
-spawn_sub_agent(subagent_type="oh-my-codex:executor-low", model="haiku", prompt="Add missing type export for Config interface")
-spawn_sub_agent(subagent_type="oh-my-codex:executor", model="sonnet", prompt="Implement the /api/users endpoint with validation")
-spawn_sub_agent(subagent_type="oh-my-codex:executor", model="sonnet", prompt="Add integration tests for the auth middleware")
+delegate(role="executor", tier="LOW", task="Add missing type export for Config interface")
+delegate(role="executor", tier="STANDARD", task="Implement the /api/users endpoint with validation")
+delegate(role="test-engineer", tier="STANDARD", task="Add integration tests for the auth middleware")
 ```
 Why good: Independent tasks at appropriate tiers, all fired at once.
 </Good>
@@ -84,8 +84,8 @@ Why good: Independent tasks at appropriate tiers, all fired at once.
 <Good>
 Correct use of background execution:
 ```
-spawn_sub_agent(subagent_type="oh-my-codex:executor", model="sonnet", prompt="npm install && npm run build", run_in_background=true)
-spawn_sub_agent(subagent_type="oh-my-codex:executor-low", model="haiku", prompt="Update the README with new API endpoints")
+delegate(role="executor", tier="STANDARD", task="npm install && npm run build", run_in_background=true)
+delegate(role="writer", tier="LOW", task="Update the README with new API endpoints")
 ```
 Why good: Long build runs in background while short task runs in foreground.
 </Good>
@@ -93,9 +93,9 @@ Why good: Long build runs in background while short task runs in foreground.
 <Bad>
 Sequential execution of independent work:
 ```
-result1 = spawn_sub_agent(executor-low, "Add type export")  # wait...
-result2 = spawn_sub_agent(executor, "Implement endpoint")     # wait...
-result3 = spawn_sub_agent(executor, "Add tests")              # wait...
+result1 = delegate(executor, LOW, "Add type export")  # wait...
+result2 = delegate(executor, STANDARD, "Implement endpoint")     # wait...
+result3 = delegate(test-engineer, STANDARD, "Add tests")              # wait...
 ```
 Why bad: These tasks are independent. Running them sequentially wastes time.
 </Bad>
@@ -103,9 +103,9 @@ Why bad: These tasks are independent. Running them sequentially wastes time.
 <Bad>
 Wrong tier selection:
 ```
-spawn_sub_agent(subagent_type="oh-my-codex:executor-high", model="opus", prompt="Add a missing semicolon")
+delegate(role="executor", tier="THOROUGH", task="Add a missing semicolon")
 ```
-Why bad: Opus is expensive overkill for a trivial fix. Use executor-low with Haiku instead.
+Why bad: THOROUGH tier is expensive overkill for a trivial fix. Use LOW-tier execution instead.
 </Bad>
 </Examples>
 

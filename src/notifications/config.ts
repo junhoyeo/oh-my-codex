@@ -20,6 +20,12 @@ import type {
   VerbosityLevel,
 } from "./types.js";
 import { getHookConfig, mergeHookConfigIntoNotificationConfig } from "./hook-config.js";
+import {
+  getTempBuiltinSelectors,
+  isNotifyTempEnvActive,
+  isOpenClawSelectedInTempContract,
+  readNotifyTempContractFromEnv,
+} from "./temp-contract.js";
 
 const CONFIG_FILE = join(codexHome(), ".omx-config.json");
 
@@ -307,9 +313,63 @@ function applyHookConfigIfPresent(config: FullNotificationConfig): FullNotificat
   return mergeHookConfigIntoNotificationConfig(hookConfig, config);
 }
 
+function hasCustomTransportAlias(config: FullNotificationConfig): boolean {
+  const cli = config.custom_cli_command;
+  const webhook = config.custom_webhook_command;
+  const cliEnabled = Boolean(cli && cli.enabled !== false && cli.command);
+  const webhookEnabled = Boolean(webhook && webhook.enabled !== false && webhook.url);
+  return cliEnabled || webhookEnabled;
+}
+
+function normalizeCustomTransportGate(config: FullNotificationConfig): FullNotificationConfig {
+  if (config.openclaw?.enabled) return config;
+  if (!hasCustomTransportAlias(config)) return config;
+  return {
+    ...config,
+    openclaw: { enabled: true },
+  };
+}
+
+function buildTempModeConfigFromContract(): FullNotificationConfig | null {
+  const contract = readNotifyTempContractFromEnv(process.env);
+  const envActive = isNotifyTempEnvActive(process.env);
+  if (!contract?.active && !envActive) return null;
+
+  const selectors = getTempBuiltinSelectors(contract);
+  const envConfig = buildConfigFromEnv();
+  const config: FullNotificationConfig = { enabled: false };
+
+  if (selectors.has("discord")) {
+    if (envConfig?.discord) config.discord = envConfig.discord;
+    if (envConfig?.["discord-bot"]) config["discord-bot"] = envConfig["discord-bot"];
+  }
+  if (selectors.has("telegram") && envConfig?.telegram) {
+    config.telegram = envConfig.telegram;
+  }
+  if (selectors.has("slack") && envConfig?.slack) {
+    config.slack = envConfig.slack;
+  }
+  if (isOpenClawSelectedInTempContract(contract)) {
+    config.openclaw = { enabled: true };
+  }
+
+  config.enabled = Boolean(
+    config.discord?.enabled
+    || config["discord-bot"]?.enabled
+    || config.telegram?.enabled
+    || config.slack?.enabled
+    || config.openclaw?.enabled,
+  );
+
+  return config;
+}
+
 export function getNotificationConfig(
   profileName?: string,
 ): FullNotificationConfig | null {
+  const tempModeConfig = buildTempModeConfigFromContract();
+  if (tempModeConfig) return tempModeConfig;
+
   const raw = readRawConfig();
 
   if (raw) {
@@ -325,7 +385,7 @@ export function getNotificationConfig(
         const merged = envConfig
           ? mergeEnvIntoFileConfig(profileConfig, envConfig)
           : profileConfig;
-        return applyHookConfigIfPresent(merged);
+        return applyHookConfigIfPresent(normalizeCustomTransportGate(merged));
       }
 
       // Fall back to flat config (backward compatible)
@@ -334,7 +394,9 @@ export function getNotificationConfig(
       }
       const envConfig = buildConfigFromEnv();
       if (envConfig) {
-        return applyHookConfigIfPresent(mergeEnvIntoFileConfig(notifications, envConfig));
+        return applyHookConfigIfPresent(
+          normalizeCustomTransportGate(mergeEnvIntoFileConfig(notifications, envConfig)),
+        );
       }
       const envMention = validateMention(process.env.OMX_DISCORD_MENTION);
       if (envMention) {
@@ -345,9 +407,9 @@ export function getNotificationConfig(
         if (patched.discord && patched.discord.mention === undefined) {
           patched.discord = { ...patched.discord, mention: envMention };
         }
-        return applyHookConfigIfPresent(patched);
+        return applyHookConfigIfPresent(normalizeCustomTransportGate(patched));
       }
-      return applyHookConfigIfPresent(notifications);
+      return applyHookConfigIfPresent(normalizeCustomTransportGate(notifications));
     }
   }
 
@@ -441,7 +503,8 @@ export function isEventEnabled(
       config.telegram?.enabled ||
       config.slack?.enabled ||
       config.webhook?.enabled ||
-      config.openclaw?.enabled
+      config.openclaw?.enabled ||
+      hasCustomTransportAlias(config)
     );
   }
 
@@ -461,7 +524,8 @@ export function isEventEnabled(
     config.telegram?.enabled ||
     config.slack?.enabled ||
     config.webhook?.enabled ||
-    config.openclaw?.enabled
+    config.openclaw?.enabled ||
+    hasCustomTransportAlias(config)
   );
 }
 
@@ -618,6 +682,26 @@ const REPLY_MAX_MESSAGE_LENGTH_MIN = 1;
 const REPLY_MAX_MESSAGE_LENGTH_MAX = 4_000;
 const REPLY_MAX_MESSAGE_LENGTH_DEFAULT = 500;
 
+interface ReplySettingsRaw {
+  enabled?: unknown;
+  authorizedDiscordUserIds?: unknown;
+  pollIntervalMs?: unknown;
+  rateLimitPerMinute?: unknown;
+  maxMessageLength?: unknown;
+  includePrefix?: unknown;
+}
+
+interface NotificationsConfigRaw {
+  reply?: ReplySettingsRaw;
+}
+
+function readReplySettings(raw: Record<string, unknown> | null): ReplySettingsRaw | undefined {
+  const notificationsUnknown = raw?.notifications;
+  if (!notificationsUnknown || typeof notificationsUnknown !== 'object') return undefined;
+  const notifications = notificationsUnknown as NotificationsConfigRaw;
+  return notifications.reply;
+}
+
 function parseIntegerInput(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isFinite(value)) {
     return Math.trunc(value);
@@ -658,7 +742,7 @@ export function getReplyConfig(): import("./types.js").ReplyConfig | null {
   if (!hasDiscordBot && !hasTelegram) return null;
 
   const raw = readRawConfig();
-  const replyRaw = (raw?.notifications as any)?.reply;
+  const replyRaw = readReplySettings(raw);
 
   const enabled = process.env.OMX_REPLY_ENABLED === "true" || replyRaw?.enabled === true;
   if (!enabled) return null;

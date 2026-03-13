@@ -7,8 +7,10 @@ import {
   normalizeCodexLaunchArgs,
   buildTmuxShellCommand,
   buildTmuxPaneCommand,
+  buildWindowsPromptCommand,
   buildTmuxSessionName,
   resolveCliInvocation,
+  commandOwnsLocalHelp,
   resolveCodexLaunchPolicy,
   classifyCodexExecFailure,
   resolveSignalExitCode,
@@ -27,8 +29,15 @@ import {
   buildDetachedSessionBootstrapSteps,
   buildDetachedSessionFinalizeSteps,
   buildDetachedSessionRollbackSteps,
+  resolveNotifyTempContract,
+  buildNotifyTempStartupMessages,
 } from '../index.js';
 import { HUD_TMUX_HEIGHT_LINES } from '../../hud/constants.js';
+import { DEFAULT_FRONTIER_MODEL, getTeamLowComplexityModel } from '../../config/models.js';
+
+function expectedLowComplexityModel(codexHomeOverride?: string): string {
+  return getTeamLowComplexityModel(codexHomeOverride);
+}
 
 describe('normalizeCodexLaunchArgs', () => {
   it('maps --madmax to codex bypass flag', () => {
@@ -146,15 +155,92 @@ describe('normalizeCodexLaunchArgs', () => {
       ['--model', 'gpt-5'],
     );
   });
+
+  it('does not forward notify-temp flags/selectors to leader codex args', () => {
+    const parsed = resolveNotifyTempContract(
+      ['--notify-temp', '--discord', '--custom', 'openclaw:ops', '--custom=my-hook', '--model', 'gpt-5'],
+      {},
+    );
+    assert.deepEqual(normalizeCodexLaunchArgs(parsed.passthroughArgs), ['--model', 'gpt-5']);
+  });
+});
+
+describe('resolveNotifyTempContract', () => {
+  it('activates from --notify-temp with no providers', () => {
+    const parsed = resolveNotifyTempContract(['--notify-temp', '--model', 'gpt-5'], {});
+    assert.equal(parsed.contract.active, true);
+    assert.equal(parsed.contract.source, 'cli');
+    assert.deepEqual(parsed.contract.canonicalSelectors, []);
+    assert.deepEqual(parsed.passthroughArgs, ['--model', 'gpt-5']);
+  });
+
+  it('auto-activates when provider selectors are present', () => {
+    const parsed = resolveNotifyTempContract(['--discord', '--slack'], {});
+    assert.equal(parsed.contract.active, true);
+    assert.equal(parsed.contract.source, 'providers');
+    assert.deepEqual(parsed.contract.canonicalSelectors, ['discord', 'slack']);
+    assert.equal(parsed.contract.warnings.some((line) => line.includes('imply temp mode')), true);
+  });
+
+  it('supports repeated --custom forms and canonicalizes selectors', () => {
+    const parsed = resolveNotifyTempContract(
+      ['--custom', 'OpenClaw:Ops', '--custom=my-hook', '--custom=', '--custom'],
+      {},
+    );
+    assert.deepEqual(parsed.contract.canonicalSelectors, ['openclaw:ops', 'custom:my-hook']);
+    assert.equal(parsed.contract.warnings.length >= 1, true);
+  });
+
+  it('activates from OMX_NOTIFY_TEMP=1 env parity', () => {
+    const parsed = resolveNotifyTempContract(['--model', 'gpt-5'], { OMX_NOTIFY_TEMP: '1' });
+    assert.equal(parsed.contract.active, true);
+    assert.equal(parsed.contract.source, 'env');
+    assert.deepEqual(parsed.passthroughArgs, ['--model', 'gpt-5']);
+  });
+});
+
+
+
+describe('buildNotifyTempStartupMessages', () => {
+  it('always emits summary when temp mode is active', () => {
+    const result = buildNotifyTempStartupMessages(
+      {
+        active: true,
+        selectors: ['discord'],
+        canonicalSelectors: ['discord'],
+        warnings: [],
+        source: 'cli',
+      },
+      true,
+    );
+    assert.deepEqual(result.infoLines, [
+      'notify temp: active | providers=discord | persistent-routing=bypassed',
+    ]);
+    assert.deepEqual(result.warningLines, []);
+  });
+
+  it('emits no-valid-provider warning when no provider is configured', () => {
+    const result = buildNotifyTempStartupMessages(
+      {
+        active: true,
+        selectors: [],
+        canonicalSelectors: [],
+        warnings: ['notify temp: provider selectors imply temp mode (auto-activated)'],
+        source: 'providers',
+      },
+      false,
+    );
+    assert.equal(result.warningLines.includes('notify temp: no valid providers resolved; notifications skipped'), true);
+  });
 });
 
 describe('resolveWorkerSparkModel', () => {
   it('returns spark model string when --spark is present', () => {
-    assert.equal(resolveWorkerSparkModel(['--spark', '--yolo']), 'gpt-5.3-codex-spark');
+    assert.equal(resolveWorkerSparkModel(['--spark', '--yolo']), expectedLowComplexityModel());
   });
 
   it('returns spark model string when --madmax-spark is present', () => {
-    assert.equal(resolveWorkerSparkModel(['--madmax-spark']), 'gpt-5.3-codex-spark');
+    assert.equal(resolveWorkerSparkModel(['--madmax-spark']), expectedLowComplexityModel());
   });
 
   it('returns undefined when neither spark flag is present', () => {
@@ -182,27 +268,76 @@ describe('resolveWorkerSparkModel', () => {
 describe('resolveTeamWorkerLaunchArgsEnv (spark)', () => {
   it('injects spark model as worker default when no explicit env model', () => {
     assert.equal(
-      resolveTeamWorkerLaunchArgsEnv(undefined, [], true, 'gpt-5.3-codex-spark'),
-      '--model gpt-5.3-codex-spark'
+      resolveTeamWorkerLaunchArgsEnv(undefined, [], true, expectedLowComplexityModel()),
+      `--model ${expectedLowComplexityModel()}`
     );
   });
 
   it('explicit env model overrides spark default', () => {
     assert.equal(
-      resolveTeamWorkerLaunchArgsEnv('--model gpt-5', [], true, 'gpt-5.3-codex-spark'),
+      resolveTeamWorkerLaunchArgsEnv('--model gpt-5', [], true, expectedLowComplexityModel()),
       '--model gpt-5'
     );
   });
 
   it('inherited leader model overrides spark default', () => {
     assert.equal(
-      resolveTeamWorkerLaunchArgsEnv(undefined, ['--model', 'gpt-4.1'], true, 'gpt-5.3-codex-spark'),
+      resolveTeamWorkerLaunchArgsEnv(undefined, ['--model', 'gpt-4.1'], true, expectedLowComplexityModel()),
       '--model gpt-4.1'
     );
   });
 });
 
+describe('commandOwnsLocalHelp', () => {
+  it('returns true for nested commands that render their own help output', () => {
+    for (const command of ['agents-init', 'ask', 'deepinit', 'hooks', 'hud', 'ralph', 'resume', 'session', 'sparkshell', 'team', 'tmux-hook']) {
+      assert.equal(commandOwnsLocalHelp(command), true, `expected ${command} to own local help`);
+    }
+  });
+
+  it('returns false for top-level help-only commands', () => {
+    for (const command of ['help', 'launch', 'version']) {
+      assert.equal(commandOwnsLocalHelp(command), false, `expected ${command} to use top-level help`);
+    }
+  });
+});
+
 describe('resolveCliInvocation', () => {
+  it('resolves explore to explore command', () => {
+    assert.deepEqual(resolveCliInvocation(['explore', '--prompt', 'find', 'auth']), {
+      command: 'explore',
+      launchArgs: [],
+    });
+  });
+
+  it('resolves ask to ask command', () => {
+    assert.deepEqual(resolveCliInvocation(['ask', 'claude', 'hello']), {
+      command: 'ask',
+      launchArgs: [],
+    });
+  });
+
+  it('resolves session to session command', () => {
+    assert.deepEqual(resolveCliInvocation(['session', 'search', 'startup evidence']), {
+      command: 'session',
+      launchArgs: [],
+    });
+  });
+
+  it('resolves resume to resume command and forwards trailing args', () => {
+    assert.deepEqual(resolveCliInvocation(['resume', '--last']), {
+      command: 'resume',
+      launchArgs: ['--last'],
+    });
+  });
+
+  it('resolves resume session id and prompt as forwarded args', () => {
+    assert.deepEqual(resolveCliInvocation(['resume', 'session-123', 'continue here']), {
+      command: 'resume',
+      launchArgs: ['session-123', 'continue here'],
+    });
+  });
+
   it('resolves hooks to hooks command', () => {
     assert.deepEqual(resolveCliInvocation(['hooks']), {
       command: 'hooks',
@@ -210,9 +345,37 @@ describe('resolveCliInvocation', () => {
     });
   });
 
+  it('resolves agents-init to agents-init command', () => {
+    assert.deepEqual(resolveCliInvocation(['agents-init', '.']), {
+      command: 'agents-init',
+      launchArgs: [],
+    });
+  });
+
+  it('resolves deepinit to deepinit alias command', () => {
+    assert.deepEqual(resolveCliInvocation(['deepinit', 'src']), {
+      command: 'deepinit',
+      launchArgs: [],
+    });
+  });
+
   it('resolves --help to the help command instead of launch', () => {
     assert.deepEqual(resolveCliInvocation(['--help']), {
       command: 'help',
+      launchArgs: [],
+    });
+  });
+
+  it('resolves --version to the version command instead of launch', () => {
+    assert.deepEqual(resolveCliInvocation(['--version']), {
+      command: 'version',
+      launchArgs: [],
+    });
+  });
+
+  it('resolves -v to the version command instead of launch', () => {
+    assert.deepEqual(resolveCliInvocation(['-v']), {
+      command: 'version',
       launchArgs: [],
     });
   });
@@ -396,12 +559,49 @@ describe('detached tmux new-session sequencing', () => {
       "'node' '/tmp/omx.js' 'hud' '--watch'",
       '--model gpt-5',
       '/tmp/codex-home',
+      '{"active":true}',
     );
     assert.deepEqual(steps.map((step) => step.name), ['new-session', 'split-and-capture-hud-pane']);
     assert.equal(steps[1]?.args[3], String(HUD_TMUX_HEIGHT_LINES));
     assert.equal(steps[1]?.args[6], 'omx-demo');
     assert.equal(steps[1]?.args.includes('-P'), true);
     assert.equal(steps[1]?.args.includes('#{pane_id}'), true);
+    assert.equal(steps[0]?.args.includes('-e'), true);
+    assert.equal(steps[0]?.args.includes('OMX_NOTIFY_TEMP_CONTRACT={\"active\":true}'), true);
+  });
+
+  it('buildDetachedSessionBootstrapSteps forwards temp contract env to detached tmux session', () => {
+    const steps = buildDetachedSessionBootstrapSteps(
+      'omx-demo',
+      '/tmp/project',
+      "'codex' '--model' 'gpt-5'",
+      "'node' '/tmp/omx.js' 'hud' '--watch'",
+      null,
+      undefined,
+      '{"active":true,"canonicalSelectors":["discord"]}',
+    );
+    const newSession = steps.find((step) => step.name === 'new-session');
+    assert.ok(newSession);
+    assert.equal(
+      newSession!.args.includes('-e')
+      && newSession!.args.some((arg) => arg.startsWith('OMX_NOTIFY_TEMP_CONTRACT=')),
+      true,
+    );
+  });
+
+  it('buildDetachedSessionBootstrapSteps starts native Windows detached sessions with powershell', () => {
+    const steps = buildDetachedSessionBootstrapSteps(
+      'omx-demo',
+      'C:/project',
+      "'codex' '--dangerously-bypass-approvals-and-sandbox'",
+      "'node' 'omx.js' 'hud' '--watch'",
+      '--model gpt-5',
+      'C:/codex-home',
+      null,
+      true,
+    );
+    assert.equal(steps[0]?.name, 'new-session');
+    assert.equal(steps[0]?.args.at(-1), 'powershell.exe');
   });
 
   it('buildDetachedSessionFinalizeSteps keeps schedule after split-capture and before attach', () => {
@@ -430,6 +630,14 @@ describe('detached tmux new-session sequencing', () => {
     assert.match(schedule?.args[2] ?? '', new RegExp(`-y ${HUD_TMUX_HEIGHT_LINES}\\b`));
     assert.match((reconcile?.args ?? []).join(' '), />\/dev\/null 2>&1 \|\| true/);
     assert.match((reconcile?.args ?? []).join(' '), new RegExp(`-y ${HUD_TMUX_HEIGHT_LINES}\\b`));
+  });
+
+  it('buildDetachedSessionFinalizeSteps skips detached resize hooks on native Windows', () => {
+    const steps = buildDetachedSessionFinalizeSteps('omx-demo', '%12', '3', true, false, true);
+    assert.deepEqual(
+      steps.map((step) => step.name),
+      ['set-mouse', 'attach-session'],
+    );
   });
 
   it('buildDetachedSessionRollbackSteps unregisters hooks before killing session', () => {
@@ -495,10 +703,19 @@ describe('buildTmuxPaneCommand', () => {
   });
 });
 
+describe('buildWindowsPromptCommand', () => {
+  it('quotes detached Windows codex commands for PowerShell prompt injection', () => {
+    assert.equal(
+      buildWindowsPromptCommand('codex', ['--dangerously-bypass-approvals-and-sandbox', '-c', 'model_reasoning_effort="high"', "it's"]),
+      "& 'codex' '--dangerously-bypass-approvals-and-sandbox' '-c' 'model_reasoning_effort=\"high\"' 'it''s'",
+    );
+  });
+});
+
 describe('buildTmuxSessionName', () => {
-  it('uses omx-directory-branch-session format', () => {
+  it('uses detached fallback quietly outside git repos', () => {
     const name = buildTmuxSessionName('/tmp/My Repo', 'omx-1770992424158-abc123');
-    assert.match(name, /^omx-my-repo-[a-z0-9-]+-1770992424158-abc123$/);
+    assert.equal(name, 'omx-my-repo-detached-1770992424158-abc123');
   });
 
   it('sanitizes invalid characters', () => {
@@ -567,15 +784,15 @@ describe('team worker launch arg inheritance helpers', () => {
     );
   });
 
-  it('resolveTeamWorkerLaunchArgsEnv uses default model when env and inherited models are absent', () => {
+  it('resolveTeamWorkerLaunchArgsEnv uses frontier default model when env and inherited models are absent', () => {
     assert.equal(
       resolveTeamWorkerLaunchArgsEnv(
         '--no-alt-screen',
         ['--dangerously-bypass-approvals-and-sandbox'],
         true,
-        'gpt-5.3-codex'
+        DEFAULT_FRONTIER_MODEL
       ),
-      '--no-alt-screen --dangerously-bypass-approvals-and-sandbox --model gpt-5.3-codex'
+      `--no-alt-screen --dangerously-bypass-approvals-and-sandbox --model ${DEFAULT_FRONTIER_MODEL}`
     );
   });
 

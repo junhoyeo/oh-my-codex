@@ -1,10 +1,10 @@
 {
-  "generatedAt": "2026-02-28T00:15:18.714Z",
-  "version": "2026.02.20.1",
+  "generatedAt": "2026-03-10T10:43:36.374Z",
+  "version": "2026.02.28.1",
   "counts": {
-    "skillCount": 30,
-    "promptCount": 29,
-    "activeSkillCount": 16,
+    "skillCount": 39,
+    "promptCount": 30,
+    "activeSkillCount": 23,
     "activeAgentCount": 18
   },
   "coreSkills": [
@@ -46,7 +46,7 @@
     {
       "name": "ecomode",
       "category": "execution",
-      "status": "deprecated",
+      "status": "merged",
       "canonical": "ultrawork",
       "core": false,
       "internalRequired": false
@@ -83,6 +83,13 @@
       "internalRequired": false
     },
     {
+      "name": "deep-interview",
+      "category": "planning",
+      "status": "active",
+      "core": false,
+      "internalRequired": false
+    },
+    {
       "name": "analyze",
       "category": "shortcut",
       "status": "alias",
@@ -115,6 +122,13 @@
       "internalRequired": false
     },
     {
+      "name": "ai-slop-cleaner",
+      "category": "shortcut",
+      "status": "active",
+      "core": false,
+      "internalRequired": false
+    },
+    {
       "name": "code-review",
       "category": "shortcut",
       "status": "active",
@@ -127,6 +141,22 @@
       "category": "shortcut",
       "status": "active",
       "canonical": "security-reviewer",
+      "core": false,
+      "internalRequired": false
+    },
+    {
+      "name": "visual-verdict",
+      "category": "shortcut",
+      "status": "active",
+      "canonical": "vision",
+      "core": false,
+      "internalRequired": false
+    },
+    {
+      "name": "web-clone",
+      "category": "shortcut",
+      "status": "active",
+      "canonical": "vision",
       "core": false,
       "internalRequired": false
     },
@@ -151,6 +181,20 @@
       "category": "shortcut",
       "status": "alias",
       "canonical": "plan --review",
+      "core": false,
+      "internalRequired": false
+    },
+    {
+      "name": "ask-claude",
+      "category": "shortcut",
+      "status": "active",
+      "core": false,
+      "internalRequired": false
+    },
+    {
+      "name": "ask-gemini",
+      "category": "shortcut",
+      "status": "active",
       "core": false,
       "internalRequired": false
     },
@@ -211,10 +255,9 @@
       "internalRequired": false
     },
     {
-      "name": "configure-telegram",
+      "name": "configure-notifications",
       "category": "utility",
-      "status": "merged",
-      "canonical": "omx-setup",
+      "status": "active",
       "core": false,
       "internalRequired": false
     },
@@ -222,7 +265,31 @@
       "name": "configure-discord",
       "category": "utility",
       "status": "merged",
-      "canonical": "omx-setup",
+      "canonical": "configure-notifications",
+      "core": false,
+      "internalRequired": false
+    },
+    {
+      "name": "configure-telegram",
+      "category": "utility",
+      "status": "merged",
+      "canonical": "configure-notifications",
+      "core": false,
+      "internalRequired": false
+    },
+    {
+      "name": "configure-slack",
+      "category": "utility",
+      "status": "merged",
+      "canonical": "configure-notifications",
+      "core": false,
+      "internalRequired": false
+    },
+    {
+      "name": "configure-openclaw",
+      "category": "utility",
+      "status": "merged",
+      "canonical": "configure-notifications",
       "core": false,
       "internalRequired": false
     },
@@ -272,6 +339,11 @@
       "name": "executor",
       "category": "build",
       "status": "active"
+    },
+    {
+      "name": "team-executor",
+      "category": "build",
+      "status": "internal"
     },
     {
       "name": "verifier",
@@ -401,6 +473,10 @@
   ],
   "aliases": [
     {
+      "name": "ecomode",
+      "canonical": "ultrawork"
+    },
+    {
       "name": "ultraqa",
       "canonical": "ralph"
     },
@@ -437,12 +513,20 @@
       "canonical": "plan --review"
     },
     {
-      "name": "configure-telegram",
-      "canonical": "omx-setup"
+      "name": "configure-discord",
+      "canonical": "configure-notifications"
     },
     {
-      "name": "configure-discord",
-      "canonical": "omx-setup"
+      "name": "configure-telegram",
+      "canonical": "configure-notifications"
+    },
+    {
+      "name": "configure-slack",
+      "canonical": "configure-notifications"
+    },
+    {
+      "name": "configure-openclaw",
+      "canonical": "configure-notifications"
     },
     {
       "name": "ralph-init",
